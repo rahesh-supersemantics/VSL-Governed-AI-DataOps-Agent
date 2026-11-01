@@ -139,6 +139,60 @@ def test_listing_paginates_filters_and_orders_newest_first(store):
     assert store.list_incidents(status="investigated", severity=None, limit=10, offset=0) == ([], 0)
 
 
+def test_listing_breaks_created_at_ties_by_insertion_order_not_by_random_id(tmp_path, monkeypatch):
+    """Incidents created within one clock tick share a created_at; the newest-first order must still follow creation.
+
+    The clock is frozen and the generated ids run *against* creation order, so ordering by incident_id gives the wrong
+    answer every time instead of by chance."""
+    import itertools
+    from datetime import datetime, timezone
+
+    from app.persistence import repositories
+
+    db = OperationsDatabase(tmp_path / "tie.sqlite3")
+    db.migrate()
+    tied = OperationsStore(db, clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
+    descending = (type("FakeUuid", (), {"hex": f"{n:020x}" + "0" * 12})() for n in itertools.count(1000, -1))
+    monkeypatch.setattr(repositories.uuid, "uuid4", lambda: next(descending))
+    created = [incident(tied) for _ in range(5)]
+    ids = [row["incident_id"] for row in created]
+    assert ids == sorted(ids, reverse=True)  # ids run against creation order
+    assert len({row["created_at"] for row in created}) == 1  # every created_at is identical
+    page, total = tied.list_incidents(status=None, severity=None, limit=2, offset=0)
+    assert total == 5 and [r["incident_id"] for r in page] == ids[::-1][:2]  # the two most recently created
+    page2, _ = tied.list_incidents(status=None, severity=None, limit=2, offset=2)
+    assert [r["incident_id"] for r in page2] == ids[::-1][2:4]  # pagination continues in the same order, no repeats
+    page3, _ = tied.list_incidents(status=None, severity=None, limit=2, offset=4)
+    assert [r["incident_id"] for r in page3] == [ids[0]]
+
+def test_investigation_and_recovery_listings_break_created_at_ties_by_insertion_order(tmp_path, monkeypatch):
+    """Same defect as the incident listing: a tied created_at must not be ordered by the random inv-/rec- id."""
+    import itertools
+    from datetime import datetime, timezone
+    from app.persistence import repositories
+    db = OperationsDatabase(tmp_path / "tie2.sqlite3"); db.migrate()
+    tied = OperationsStore(db, clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
+    descending = (type("FakeUuid", (), {"hex": f"{n:020x}" + "0" * 12})() for n in itertools.count(5000, -1))
+    monkeypatch.setattr(repositories.uuid, "uuid4", lambda: next(descending))
+    inc = incident(tied)["incident_id"]
+    inv_ids, rec_ids = [], []
+    for _ in range(4):
+        inv = tied.create_investigation(incident_id=inc, mode="offline", requested_by="tester")["investigation_id"]
+        assert tied.complete_investigation(inv, report={}, report_status="ok", summary="s", evidence_refs=[])
+        inv_ids.append(inv)
+    for _ in range(4):
+        rec = tied.create_recovery(incident_id=inc, investigation_id=None, action_type="a", parameters={},
+                                   requested_by="tester")["recovery_id"]
+        assert tied.record_recovery_outcome(rec, status="executed")
+        rec_ids.append(rec)
+    assert inv_ids == sorted(inv_ids, reverse=True) and rec_ids == sorted(rec_ids, reverse=True)  # newest has the smallest id
+    assert [r["investigation_id"] for r in tied.list_investigations(inc)] == inv_ids[::-1]
+    assert tied.latest_completed_investigation(inc)["investigation_id"] == inv_ids[-1]
+    assert [r["recovery_id"] for r in tied.list_recoveries(inc)] == rec_ids[::-1]
+    assert [r["recovery_id"] for r in tied.recent_recoveries(10)] == rec_ids[::-1]
+
+
+
 def test_severity_and_status_are_constrained_by_the_database_itself(store, tmp_path):
     with sqlite3.connect(tmp_path / "ops.sqlite3") as conn:
         with pytest.raises(sqlite3.IntegrityError):

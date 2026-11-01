@@ -138,7 +138,7 @@ def test_recovery_refuses_any_database_not_named_test(database):
 
 
 def test_recovery_allows_a_test_database_and_the_in_memory_simulation(service):
-    assert_recovery_target(fake_service(SqlRepo("dataops_sim_test")))
+    assert_recovery_target(fake_service(SqlRepo("dataops_sim_test")), {"dataops_sim_test"})
     assert_recovery_target(service)
 
 
@@ -147,3 +147,79 @@ def test_a_sql_repository_without_an_engine_is_refused():
     repo = type("R", (), {"__module__": "app.db.repository"})()
     with pytest.raises(UnsafeRecoveryTarget):
         assert_recovery_target(fake_service(repo))
+
+
+# ------------------------------------------------------------------ real-shaped engines, allowlist, live-target check
+from sqlalchemy.engine import URL  # noqa: E402
+
+from app.recovery.actions import PreconditionFailed, assert_live_target, resolve_connection_target  # noqa: E402
+
+
+class OdbcEngine:
+    """The shape the application really builds: the database lives only inside the opaque ODBC string."""
+
+    def __init__(self, conn: str) -> None:
+        self.url = URL.create("mssql+pyodbc", query={"odbc_connect": conn})
+
+
+def odbc_repo(database: str, server: str = "localhost\\SQLEXPRESS03", extra: str = ""):
+    repo = SqlRepo("ignored")
+    repo.engine = OdbcEngine(f"DRIVER={{ODBC Driver 18 for SQL Server}};SERVER={server};DATABASE={database};Trusted_Connection=yes;{extra}")
+    return repo
+
+
+def test_database_is_read_from_the_odbc_string_so_the_demo_database_is_no_longer_refused_by_mistake():
+    repo = odbc_repo("dataops_demo_test")
+    assert resolve_connection_target(repo.engine) == ("localhost\\sqlexpress03", "dataops_demo_test")
+    assert_recovery_target(fake_service(repo), {"dataops_demo_test"})
+    assert_recovery_target(fake_service(repo), {"localhost\\sqlexpress03/dataops_demo_test"})
+
+
+@pytest.mark.parametrize("db", ["dataops_sim", "master", "tempdb", "dataops_demo"])
+def test_odbc_shaped_engines_on_protected_or_non_test_names_are_refused_even_if_allowlisted(db):
+    with pytest.raises(UnsafeRecoveryTarget):
+        assert_recovery_target(fake_service(odbc_repo(db)), {db})
+
+
+@pytest.mark.parametrize("allow", [None, set(), {""}, {"other_test"}, {"otherserver/dataops_demo_test"}])
+def test_a_test_database_that_is_not_allowlisted_is_refused(allow):
+    with pytest.raises(UnsafeRecoveryTarget):
+        assert_recovery_target(fake_service(odbc_repo("dataops_demo_test")), allow)
+
+
+def test_ambiguous_or_missing_database_in_the_connection_string_is_refused():
+    with pytest.raises(UnsafeRecoveryTarget):
+        assert_recovery_target(fake_service(odbc_repo("dataops_demo_test", extra="Database=dataops_sim;")), {"dataops_demo_test"})
+    repo = SqlRepo("x")
+    repo.engine = OdbcEngine("DRIVER={x};SERVER=localhost;Trusted_Connection=yes")
+    with pytest.raises(UnsafeRecoveryTarget):
+        assert_recovery_target(fake_service(repo), {"anything_test"})
+
+
+def test_executor_cannot_be_built_without_an_allowlist_for_a_sql_target():
+    with pytest.raises(UnsafeRecoveryTarget):
+        RecoveryExecutor(fake_service(odbc_repo("dataops_demo_test")))
+
+
+class _Probe:
+    def __init__(self, answer):
+        self.answer = answer
+
+    def __call__(self):
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+
+@pytest.mark.parametrize("answer", ["dataops_sim", "", "other_test", RuntimeError("down")])
+def test_live_target_must_match_the_validated_one_or_the_action_does_not_run(answer):
+    repo = odbc_repo("dataops_demo_test")
+    repo.current_database = _Probe(answer)
+    with pytest.raises(PreconditionFailed):
+        assert_live_target(fake_service(repo))
+
+
+def test_live_target_matching_the_validated_one_passes():
+    repo = odbc_repo("dataops_demo_test")
+    repo.current_database = _Probe("DATAOPS_DEMO_TEST")
+    assert_live_target(fake_service(repo))

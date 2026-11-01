@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
+from vsl_core.exceptions import AutomationDeniedException
 
 from app.recovery.auth import approve_permission
 from app.simulation.scenarios import SCENARIOS
@@ -102,17 +103,93 @@ class UnsafeRecoveryTarget(Exception):
     """The repository behind the simulation is not a permitted recovery target."""
 
 
-def assert_recovery_target(service: SimulationService) -> None:
-    """Allow in-memory repositories and SQL repositories on a database named ``*_test`` only."""
+PROTECTED_DATABASES = frozenset({"dataops_sim", "master", "model", "msdb", "tempdb"})
+_DATABASE_KEYS = ("database", "initial catalog")
+_SERVER_KEYS = ("server", "data source", "address", "addr", "network address")
+
+
+def _odbc_fields(connection_string: str) -> dict[str, set[str]]:
+    """Key -> every distinct value in an ODBC connection string (keys lower-cased, braces stripped)."""
+    found: dict[str, set[str]] = {}
+    for part in connection_string.split(";"):
+        key, sep, value = part.partition("=")
+        if sep:
+            found.setdefault(key.strip().lower(), set()).add(value.strip().strip("{}").strip().lower())
+    return found
+
+
+def resolve_connection_target(engine: Any) -> tuple[str, str]:
+    """(server, database), lower-cased, taken from what the engine will really connect to.
+
+    The application builds ``mssql+pyodbc:///?odbc_connect=<ODBC string>``; SQLAlchemy keeps that string opaque, so
+    ``engine.url.database`` is ``None`` for it. The database therefore has to be read from the ODBC string itself.
+    Ambiguous input (the same key given two different values) is refused rather than guessed at.
+    """
+    url = getattr(engine, "url", None)
+    database = (getattr(url, "database", None) or "").strip().lower()
+    server = (getattr(url, "host", None) or "").strip().lower()
+    odbc = (getattr(url, "query", None) or {}).get("odbc_connect")
+    if isinstance(odbc, str) and odbc:
+        fields = _odbc_fields(odbc)
+        for keys, current in ((_DATABASE_KEYS, "database"), (_SERVER_KEYS, "server")):
+            values = {v for k in keys for v in fields.get(k, ())}
+            if len(values) > 1:
+                raise UnsafeRecoveryTarget(f"the connection string names more than one {current}")
+            if values:
+                value = values.pop()
+                if current == "database":
+                    if database and database != value:
+                        raise UnsafeRecoveryTarget("the URL and the connection string name different databases")
+                    database = value
+                else:
+                    server = server or value
+    return server, database
+
+
+def normalise_allowlist(entries: Iterable[str] | None) -> frozenset[str]:
+    """Allowlist entries are ``database`` or ``server/database`` (lower-cased). Blank entries are dropped."""
+    return frozenset(e.strip().lower() for e in (entries or ()) if e and e.strip())
+
+
+def assert_recovery_target(service: SimulationService, allowed_targets: Iterable[str] | None = None) -> None:
+    """Allow in-memory repositories, and SQL repositories only when BOTH hold for the database the engine really uses:
+    the name ends with ``_test`` AND it is explicitly allowlisted (``database`` or ``server/database``).
+
+    Fails closed: no allowlist, an unresolvable name, a protected name or any ambiguity raises."""
     repo = service.repo
     engine = getattr(repo, "engine", None)
     if engine is None:
         if type(repo).__module__.startswith("app.db"):
             raise UnsafeRecoveryTarget("SQL repository without an engine")
         return  # in-memory / fake repository
-    database = (getattr(getattr(engine, "url", None), "database", None) or "").lower()
-    if not database.endswith("_test"):
+    server, database = resolve_connection_target(engine)
+    if not database:
+        raise UnsafeRecoveryTarget("the database this connection uses could not be determined")
+    if database in PROTECTED_DATABASES or not database.endswith("_test"):
         raise UnsafeRecoveryTarget("recovery writes are only permitted on a database whose name ends with _test")
+    allowed = normalise_allowlist(allowed_targets)
+    if not allowed:
+        raise UnsafeRecoveryTarget("no recovery target is allowlisted (set RECOVERY_TARGET_ALLOWLIST)")
+    if database not in allowed and not (server and f"{server}/{database}" in allowed):
+        raise UnsafeRecoveryTarget("the database is not on the recovery target allowlist")
+
+
+def assert_live_target(service: SimulationService) -> None:
+    """Immediately before a side effect: ask the server which database the connection is really on and require it to be
+    the one that was validated. Repositories that cannot answer (in-memory fakes) are skipped."""
+    probe = getattr(service.repo, "current_database", None)
+    engine = getattr(service.repo, "engine", None)
+    if probe is None or engine is None:
+        return
+    _, expected = resolve_connection_target(engine)
+    try:
+        actual = (probe() or "").strip().lower()
+    except AutomationDeniedException:
+        raise
+    except Exception:  # noqa: BLE001 - cannot verify, so do not act
+        raise PreconditionFailed("the connected database could not be verified") from None
+    if not actual or actual != expected:
+        raise PreconditionFailed("the connected database does not match the validated recovery target")
 
 
 @dataclass
@@ -125,13 +202,19 @@ class ExecutionResult:
 class RecoveryExecutor:
     """Runs one validated action against the simulation and verifies the postcondition independently."""
 
-    def __init__(self, service: SimulationService) -> None:
-        assert_recovery_target(service)
+    def __init__(self, service: SimulationService, allowed_targets: Iterable[str] | None = None) -> None:
+        assert_recovery_target(service, allowed_targets)
         self.service = service
+        self.allowed_targets = normalise_allowlist(allowed_targets)
 
     def check_precondition(self, action: ValidatedAction) -> dict[str, Any]:
         """Read-only. Returns facts needed by ``verify``; raises ``PreconditionFailed`` if the action cannot run."""
         svc = self.service
+        try:
+            assert_recovery_target(svc, self.allowed_targets)  # revalidated at execution time, not only at start-up
+        except UnsafeRecoveryTarget:
+            raise PreconditionFailed("the recovery target is no longer permitted") from None
+        assert_live_target(svc)
         if svc.repo.get_state() is None:
             raise PreconditionFailed("the simulation is not seeded")
         if action.action_type == "rerun_pipeline":

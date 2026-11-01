@@ -28,18 +28,22 @@ APP = str(Path(__file__).resolve().parents[1] / "dashboard" / "ops_app.py")
 
 
 class _NamedEngine:
-    def __init__(self, name: str) -> None:
-        from sqlalchemy.engine import make_url
-        self.url = make_url(f"mssql+pyodbc://user@host/{name}")
+    """An engine URL in the REAL shape the application builds (``?odbc_connect=...``), where ``url.database`` is None.
+    An earlier version of this test used ``mssql+pyodbc://user@host/<name>``, which hid the real failure."""
+
+    def __init__(self, settings) -> None:
+        from sqlalchemy.engine import URL
+        self.url = URL.create("mssql+pyodbc", query={"odbc_connect": connection.build_odbc_connection_string(settings)})
 
 
-def _container(tmp_path, monkeypatch, db_name):
-    monkeypatch.setattr(connection, "make_engine", lambda settings: _NamedEngine(settings.db_name))
+def _container(tmp_path, monkeypatch, db_name, allow="dataops_demo_test,dataops_sim,dataops_prod,dataops,dataops_test_sim"):
+    monkeypatch.setattr(connection, "make_engine", lambda settings: _NamedEngine(settings))
     env = {"APPROVAL_AUTH_MODE": "dev_static", "APPROVAL_SIGNING_KEY": "s" * 40,
            "APPROVAL_DEV_CREDENTIALS": json.dumps({"k" * 32: {"subject": "the.approver", "role": "recovery_admin"}}),
            "APPROVAL_STORE_PATH": str(tmp_path / "approvals.db"), "GOVERNANCE_LEDGER_PATH": str(tmp_path / "ledger.jsonl"),
            "DATABASE_URL": f"sqlite:///{tmp_path}/ops.db", "SIM_LOG_DIR": str(tmp_path / "logs")}
-    settings = Settings(_env_file=None, db_server="localhost\\SQLEXPRESS03", db_name=db_name, db_trust_server_certificate=True)
+    settings = Settings(_env_file=None, db_server="localhost\\SQLEXPRESS03", db_name=db_name, db_trust_server_certificate=True,
+                        recovery_target_allowlist=allow)
     return build_services(env, settings)
 
 
@@ -64,7 +68,7 @@ def test_the_explanation_names_the_cause_and_the_fix_and_carries_no_secret():
         recovery_unavailable, recovery_database = "recovery_target_unavailable:UnsafeRecoveryTarget", "dataops_sim"
     message, details = recovery_unavailable_info(S)
     assert "_test" in message and "dataops_sim" in message and details["required_database_suffix"] == "_test"
-    assert "dataops_demo_test" in details["fix"] and set(details) == {"reason", "database", "required_database_suffix", "fix"}
+    assert "dataops_demo_test" in details["fix"] and set(details) == {"reason", "database", "required_database_suffix", "why", "fix"}  # "why" = fixed guard sentence, added with the allowlist
     S.recovery_unavailable = "approvals_not_configured:ApprovalConfigError"
     assert "APPROVAL_SIGNING_KEY" in recovery_unavailable_info(S)[0]
     S.recovery_unavailable = "recovery_target_unavailable:DatabaseUnavailable"

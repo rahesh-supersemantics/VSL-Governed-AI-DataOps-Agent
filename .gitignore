@@ -44,3 +44,9 @@ phase2-evidence-backup/
 
 # Local development launcher state (generated tokens and logs; never commit)
 .dev/
+
+# Olist data-quality work (Stage 2): local dataset, review package and generated reports
+docs/E-Commerce Dataset/
+claude_review_stage2/
+claude_review_stage2.zip
+reports/

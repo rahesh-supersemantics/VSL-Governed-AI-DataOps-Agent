@@ -15,8 +15,9 @@ from tests.recovery_support import approve, kinds, make_env, prop, run, start
 
 
 def test_the_executor_is_bound_to_the_test_database(svc):
-    name = svc.repo.engine.url.database
-    assert name.lower().endswith("_test") and name.lower() != "dataops_sim"
+    from app.recovery.actions import resolve_connection_target
+    _, name = resolve_connection_target(svc.repo.engine)  # url.database is None for the app's odbc_connect URLs
+    assert name.endswith("_test") and name != "dataops_sim"
 
 
 def test_governed_recovery_removes_an_injected_condition_in_the_test_database(svc, tmp_path):

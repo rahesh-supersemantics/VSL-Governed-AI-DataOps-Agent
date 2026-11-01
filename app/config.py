@@ -50,6 +50,16 @@ class Settings(BaseSettings):
     # Simulation
     sim_seed: int = 20260115
     sim_log_dir: str = Field(default="logs", min_length=1)
+
+    # Recovery write targets. Empty (the default) means NO SQL database may be written to. Entries are comma separated:
+    # `dataops_demo_test` or `server\\instance/dataops_demo_test`. Each must also end with `_test`.
+    recovery_target_allowlist: str = Field(default="", pattern=r"^[A-Za-z0-9_,.\\/\- ]{0,500}$")
+
+    # Automatic authorisation of LOW-risk actions under `risk-policy-v1` (see app/recovery/risk_policy.py). Off unless set.
+    recovery_auto_authorize_low_risk: bool = False
+
+    def recovery_targets(self) -> frozenset[str]:
+        return frozenset(p.strip().lower() for p in self.recovery_target_allowlist.split(",") if p.strip())
     freshness_threshold_minutes: int = Field(default=1500, ge=1)
 
     @field_validator("openai_api_key", "db_user", "db_password", mode="before")

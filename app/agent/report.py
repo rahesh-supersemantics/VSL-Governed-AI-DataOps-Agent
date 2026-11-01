@@ -63,7 +63,9 @@ def build_evidence(call_id: str, structured: dict[str, Any], limit: int) -> list
 
 
 # ------------------------------------------------------------------------------------- status
-def compute_status(evidence: list[EvidenceItem], tool_runs: list[ToolRun], error: ReportError | None) -> InvestigationStatus:
+def compute_status(evidence: list[EvidenceItem], tool_runs: list[ToolRun], error: ReportError | None,
+                   core_diagnostics: frozenset[str] = CORE_DIAGNOSTICS,
+                   incomplete_codes: frozenset[str] = frozenset()) -> InvestigationStatus:
     usable = [e for e in evidence if e.status != "error"]
     attempts_failed = any(r.outcome in _FAILED_OUTCOMES for r in tool_runs)
     if not usable:
@@ -71,9 +73,10 @@ def compute_status(evidence: list[EvidenceItem], tool_runs: list[ToolRun], error
     if any(e.status == "issue_detected" for e in usable):
         return "issue_identified"
     warnings = [e for e in usable if e.status == "warning"]
-    if attempts_failed or any(e.status == "error" for e in evidence) or any(_SEV_RANK.get(e.severity, 5) <= 2 for e in warnings):
+    partial = any(e.error_code in incomplete_codes for e in usable)  # a warning with unassessed rules is not a complete check
+    if attempts_failed or partial or any(e.status == "error" for e in evidence) or any(_SEV_RANK.get(e.severity, 5) <= 2 for e in warnings):
         return "inconclusive"
-    if CORE_DIAGNOSTICS - {e.tool for e in usable}:  # an unchecked area could hold the cause
+    if core_diagnostics - {e.tool for e in usable}:  # an unchecked area could hold the cause
         return "inconclusive"
     return "warnings_only" if warnings else "no_issue_detected"
 
@@ -134,11 +137,68 @@ def _cap_confidence(requested: Confidence, root: RootCause, by_id: dict[str, Evi
     return ("low", "medium", "high")[level], reasons  # type: ignore[return-value]
 
 
+# ------------------------------------------------------------------------- incompleteness and the headline
+# Words with which free model text declares a run healthy. Used only as defence in depth on runs that are NOT clean: the
+# headline of such a run is written by code, and a model statement that reads as a clean bill of health is dropped.
+_CLEAN_CLAIM = re.compile(
+    r"\b(healthy|all (checks|diagnostics|tests) (pass|passed|ok|are ok|came back clean)|everything (is |looks |appears )?(ok|okay|fine|normal|good)"
+    r"|(is|looks|appears|are) (clean|fine|normal)|no (data[- ]quality |integrity |significant |major )?(issues?|problems?|violations?|anomal\w+|errors?)"
+    r"( (were |was )?(found|detected|identified|observed))?|nothing (is )?(wrong|unusual|amiss)|no action (is )?(needed|required)|all clear|clean bill)\b", re.I)
+
+
+def claims_clean(text: str | None) -> bool:
+    return bool(_CLEAN_CLAIM.search(text or ""))
+
+
+def incompleteness(evidence: list[EvidenceItem], tool_runs: list[ToolRun], error: ReportError | None,
+                   incomplete_codes: frozenset[str]) -> list[str]:
+    """Plain reasons why the run is not a complete assessment (empty when nothing was left unassessed)."""
+    reasons: list[str] = []
+    if error is not None:
+        reasons.append(f"the investigation stopped early ({error.kind})")
+    for r in tool_runs:
+        if r.outcome in _FAILED_OUTCOMES:
+            reasons.append(f"tool call {r.call_id} ({r.tool}) ended with {r.outcome}")
+    for e in evidence:
+        if e.status == "error":
+            reasons.append(f"{e.tool} produced no result" + (f" ({e.error_code})" if e.error_code else ""))
+        elif e.error_code in incomplete_codes:
+            reasons.append(f"{e.tool} was only partly assessed ({e.error_code}): some rules did not run" + _unassessed(e))
+    return list(dict.fromkeys(reasons))
+
+
+def _unassessed(e: EvidenceItem) -> str:
+    ids = [str(x.get("rule_id")) for x in (e.digest.get("evidence") or []) if isinstance(x, dict)
+           and x.get("type") == "rule_result" and x.get("status") == "error" and x.get("rule_id")]
+    return f" - not assessed: {', '.join(ids)}" if ids else ""
+
+
+def headline(status: str, reasons: list[str], ordered: list[EvidenceItem]) -> str:
+    """The summary line of a run that is not clean, written entirely from the execution record (never from model text)."""
+    lead = {"failed": "FAILED: no usable diagnostic result was collected, so nothing can be concluded about the database.",
+            "inconclusive": "INCONCLUSIVE: the investigation is incomplete, so this is not a clean result.",
+            "issue_identified": "ISSUE(S) IDENTIFIED, but the run is incomplete: some checks or rules were not assessed.",
+            }.get(status, "INCOMPLETE RUN: some checks or rules were not assessed, so this is not a clean result.")
+    text = lead
+    if reasons:
+        text += " Not completed: " + "; ".join(reasons[:5]) + ("; ..." if len(reasons) > 5 else "") + "."
+    findings = [e for e in ordered if e.status != "error"]
+    if findings:
+        text += f" Findings from the checks that did complete: {len(findings)}. Most significant: {findings[0].summary}"
+    return text[:800]
+
+
 # ------------------------------------------------------------------------------------ report
 def finalize_report(*, investigation_id: str, incident: str, mode: str, model: str, tool_runs: list[ToolRun],
                     evidence: list[EvidenceItem], limitations: list[str], security_notes: list[str], rounds_used: int,
                     tool_calls_used: int, stop_reason: str, approved_tools: list[str], draft: ReportDraft | None = None,
-                    error: ReportError | None = None) -> InvestigationReport:
+                    error: ReportError | None = None, core_diagnostics: frozenset[str] | None = None,
+                    incomplete_codes: frozenset[str] | None = None, code_controlled: bool = False) -> InvestigationReport:
+    """``code_controlled`` is OFF by default, which keeps the original behaviour exactly (the model's summary and text are
+    used as before). A profile that turns it on (the Ecommerce profile) gets a code-written headline and incomplete-run notes
+    for every run that is not clean, and model text that reads as a clean result is dropped."""
+    core = CORE_DIAGNOSTICS if core_diagnostics is None else core_diagnostics
+    codes = frozenset() if incomplete_codes is None else incomplete_codes
     by_id = {e.evidence_id: e for e in evidence}
     blob = _evidence_text(evidence)
     tainted = _tainted_ids(evidence)
@@ -146,7 +206,9 @@ def finalize_report(*, investigation_id: str, incident: str, mode: str, model: s
     if tainted:
         notes.append("Evidence " + ", ".join(sorted(tainted)) + " contained instruction-like text; it was kept as an observation "
                      "but not accepted as support for a root cause or impact.")
-    status = compute_status(evidence, tool_runs, error)
+    status = compute_status(evidence, tool_runs, error, core, codes)
+    reasons_incomplete = incompleteness(evidence, tool_runs, error, codes) if code_controlled else []
+    not_clean = code_controlled and (status in ("failed", "inconclusive") or bool(reasons_incomplete))
 
     # Observed facts: straight from the tools.
     ordered = sorted((e for e in evidence if e.status != "ok"), key=lambda e: (e.status == "error", _SEV_RANK.get(e.severity, 5), e.evidence_id))
@@ -199,6 +261,25 @@ def finalize_report(*, investigation_id: str, incident: str, mode: str, model: s
         explanation = safe_text(draft.confidence_explanation, 600)
         steps = [safe_text(s, 300) for s in draft.recommended_next_steps if s.strip()]
         notes += [safe_text(s, 300) for s in draft.limitations if s.strip()]
+        if not_clean:  # model text may explain, but it may not read as a clean bill of health on an incomplete run
+            removed = 0
+            kept = [h for h in hypotheses if not claims_clean(h.statement)]
+            removed += len(hypotheses) - len(kept)
+            hypotheses = kept
+            if impact is not None and claims_clean(impact.statement):
+                impact, removed = None, removed + 1
+            if claims_clean(root.statement) or claims_clean(root.explanation):
+                root, removed = RootCause(status="undetermined", explanation="The evidence does not directly support a root cause."), removed + 1
+            kept_steps = [x for x in steps if not claims_clean(x)]
+            removed += len(steps) - len(kept_steps)
+            steps = kept_steps
+            if claims_clean(explanation):
+                explanation, removed = "", removed + 1
+            model_notes = [safe_text(x, 300) for x in draft.limitations if x.strip()]
+            notes = [n for n in notes if n not in model_notes or not claims_clean(n)]
+            removed += sum(1 for n in model_notes if claims_clean(n))
+            if removed:
+                notes.append(f"{removed} model statement(s) that read as a clean result were discarded because the run is not clean.")
     if dropped:
         notes.append(f"{dropped} model statement(s) were discarded because they cited no valid evidence or named identifiers not in the evidence.")
 
@@ -211,7 +292,7 @@ def finalize_report(*, investigation_id: str, incident: str, mode: str, model: s
         notes.append("Some tool output was shortened to fit size limits; see the per-tool digests.")
     if passing:
         notes.append("A passing diagnostic does not prove the reported problem is absent or resolved; it only shows that check found nothing.")
-    unchecked = sorted(CORE_DIAGNOSTICS - {e.tool for e in evidence if e.status != "error"})
+    unchecked = sorted(core - {e.tool for e in evidence if e.status != "error"})
     if evidence and unchecked and status in ("inconclusive", "failed"):
         notes.append("Diagnostics not run, or without a usable result: " + ", ".join(unchecked) + ".")
     if not evidence:
@@ -224,7 +305,15 @@ def finalize_report(*, investigation_id: str, incident: str, mode: str, model: s
     if not conf_text.strip():
         conf_text = "Derived from the supporting evidence."
 
-    if draft is not None and draft.summary.strip():
+    if reasons_incomplete:
+        notes.append("INCOMPLETE RUN: " + "; ".join(reasons_incomplete[:8]) + ". Findings from the checks that completed are kept; "
+                     "everything listed here was NOT assessed.")
+    if not_clean:
+        missing = [f"required checks without a usable result: {', '.join(unchecked)}"] if unchecked and status == "inconclusive" else []
+        summary = headline(status, reasons_incomplete + missing, ordered)  # authoritative: written by code, not by the model
+        if draft is not None and draft.summary.strip() and claims_clean(draft.summary):
+            notes.append("The model's summary claimed a clean result and was replaced by a summary derived from the execution record.")
+    elif draft is not None and draft.summary.strip():
         summary = safe_text(draft.summary, 800)
     elif ordered:
         summary = f"{len([e for e in ordered if e.status != 'error'])} finding(s). Most significant: {ordered[0].summary}"

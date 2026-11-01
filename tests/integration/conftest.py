@@ -19,6 +19,7 @@ from app.db.connection import (
     make_engine,
 )
 from app.db.repository import SqlRepository
+from app.db.safety import assert_safe_integration_target, assert_safe_reset_target
 from app.db.schema import metadata
 from app.simulation.runlog import RunLogStore
 from app.simulation.service import SimulationService
@@ -41,6 +42,7 @@ def sql_settings():
                         db_server=os.environ.get("DB_SERVER", r"localhost"),
                         db_trust_server_certificate=os.environ.get("DB_TRUST_SERVER_CERTIFICATE", "true").lower() == "true")
     assert is_local_server(settings.db_server), "Integration tests only run against a local server."
+    assert_safe_integration_target(settings)  # configuration-only check; the live connection is checked in `engine`
     return settings
 
 
@@ -52,8 +54,15 @@ def engine(sql_settings):
     except DatabaseUnavailable as exc:
         pytest.skip(f"SQL Server not reachable: {exc}")
     with admin_master.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        conn.execute(text(f"IF DB_ID(N'{TEST_DB}') IS NULL CREATE DATABASE [{TEST_DB}]"))
+        if conn.execute(text("SELECT DB_ID(:name)"), {"name": TEST_DB}).scalar() is None:
+            # The test database is normally created by a DBA; creating it needs an elevated login, so it is opt-in.
+            if os.environ.get("SQLSERVER_TESTS_ALLOW_CREATE_DB") != "1":
+                pytest.fail(f"Test database '{TEST_DB}' does not exist. Have a DBA create it, or set "
+                            "SQLSERVER_TESTS_ALLOW_CREATE_DB=1 to let this suite create it.")
+            conn.execute(text(f"CREATE DATABASE [{TEST_DB}]"))  # name validated by Settings and the guard above
     eng = make_engine(sql_settings, admin=True)
+    with eng.connect() as conn:  # the name the server reports, not the one we asked for
+        assert_safe_integration_target(sql_settings, conn.execute(text("SELECT DB_NAME()")).scalar_one())
     metadata.create_all(eng)
     yield eng
     eng.dispose()
@@ -62,9 +71,10 @@ def engine(sql_settings):
 @pytest.fixture
 def svc(engine, sql_settings, tmp_path):
     """A freshly reset baseline in the *_test database, logging under tmp_path."""
-    from app.db.safety import assert_safe_reset_target
-
-    assert_safe_reset_target(sql_settings, TEST_DB, confirmed=True)
+    with engine.connect() as conn:  # an independent reading of the target before every wipe
+        observed = conn.execute(text("SELECT DB_NAME()")).scalar_one()
+    assert_safe_integration_target(sql_settings, observed)
+    assert_safe_reset_target(sql_settings, observed, confirmed=True)
     service = SimulationService(SqlRepository(engine), RunLogStore(tmp_path / "logs"),
                                 seed=sql_settings.sim_seed,
                                 freshness_threshold_minutes=sql_settings.freshness_threshold_minutes)

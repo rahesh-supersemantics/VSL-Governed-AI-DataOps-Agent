@@ -8,14 +8,15 @@ from typing import Any, Callable
 from app.agent.config import AgentConfig
 from app.agent.graph import AgentState, GraphDeps, build_graph
 from app.agent.llm import ChatModel
-from app.agent.mcp_client import McpUnavailable, Toolbox
+from app.agent.mcp_client import McpUnavailable, Toolbox, default_server_params
 from app.agent.models import InvestigationReport
+from app.agent.profiles import AgentProfile
 from app.agent.report import failed_report, new_investigation_id
 from app.agent.safety import clean_incident
 
 
 async def investigate(incident: str, *, config: AgentConfig, llm: ChatModel, mcp_target: Any = None,
-                      progress: Callable[[str], None] | None = None) -> InvestigationReport:
+                      progress: Callable[[str], None] | None = None, profile: AgentProfile | None = None) -> InvestigationReport:
     """Investigate an incident and return the structured report.
 
     Raises ``InvalidIncident`` for an unusable description. Everything else (server unreachable, model
@@ -25,14 +26,23 @@ async def investigate(incident: str, *, config: AgentConfig, llm: ChatModel, mcp
     investigation_id = new_investigation_id()
     say = progress or (lambda _m: None)
     try:
-        async with Toolbox(mcp_target, tool_timeout=config.tool_timeout_seconds) as toolbox:
+        toolbox_args: dict[str, Any] = {}
+        if profile is not None:  # a profile selects its own server, approved tools and roll-up tools
+            toolbox_args = {"approved_tools": profile.approved_tools, "report_tools": profile.report_tools}
+            if mcp_target is None:
+                mcp_target = default_server_params(profile.server_module)
+        async with Toolbox(mcp_target, tool_timeout=config.tool_timeout_seconds, **toolbox_args) as toolbox:
             say(f"Connected to the DataOps MCP server: {len(toolbox.tools)} approved read-only tools"
                 + (f" ({len(toolbox.ignored_tools)} other tool(s) ignored)" if toolbox.ignored_tools else ""))
-            graph = build_graph(GraphDeps(llm=llm, toolbox=toolbox, config=config, progress=say))
+            graph = build_graph(GraphDeps(llm=llm, toolbox=toolbox, config=config, progress=say, profile=profile))
             state: AgentState = await graph.ainvoke(
                 {"investigation_id": investigation_id, "incident": text},
                 config={"recursion_limit": 8 * config.max_rounds + 20})
             report = InvestigationReport.model_validate(state["report"])
+            if profile is not None and config.tool_timeout_seconds < profile.min_tool_timeout_seconds:
+                report.limitations.append(
+                    f"The agent tool timeout ({config.tool_timeout_seconds:g} s) is shorter than the {profile.min_tool_timeout_seconds:g} s "
+                    "the server may need to finish or to report its own time-out, so a slow tool can show up here as a timeout.")
             if toolbox.missing_tools:
                 report.limitations.append("Expected tools not offered by the server: " + ", ".join(toolbox.missing_tools) + ".")
             if toolbox.ignored_tools:

@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.agent.models import InvestigationReport
-from app.governance.ledger import GovernanceRecorder
+from app.governance.ledger import GovernanceLedgerError, GovernanceRecorder
 from app.persistence import OperationsStore, RecoveryActive
 from app.recovery import ApprovalDenied, ApprovalService, RecoveryOutcome, RecoveryWorkflow, proposal_from_report, suggest_recovery
 
@@ -121,6 +121,12 @@ class RecoveryService:
             return row
         record = self.approvals.store.get(row["approval_request_id"]) if row["approval_request_id"] else None
         if record is not None and record.status == "consumed":
+            try:  # best effort: the status below is the source of truth even if the ledger cannot be written
+                self.recorder.monitor(decision_id=row["decision_id"] or record.request_id, drift=False, outcome="recovery_escalated",
+                                      request_id=record.request_id, action=record.action_type, trigger="interrupted_before_result_recorded",
+                                      next_step="a person reviews the actual state; automated recovery stopped; no retry")
+            except GovernanceLedgerError:
+                pass
             self.store.record_recovery_outcome(
                 row["recovery_id"], status="recovery_uncertain", execution_status="uncertain",
                 reasons=["interrupted_before_result_recorded"], verified_outcome="unknown", started=True,

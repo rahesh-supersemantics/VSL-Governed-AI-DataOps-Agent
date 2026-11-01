@@ -1,0 +1,14 @@
+# Theme only: no server, browser or secret settings. Gives the hybrid look (light workspace, navy sidebar)
+# regardless of the visitor's OS colour scheme, which CSS overrides alone cannot do reliably.
+[theme]
+base = "light"
+primaryColor = "#3977D5"
+backgroundColor = "#F5F7FA"
+secondaryBackgroundColor = "#E9EEF5"
+textColor = "#1B2A3D"
+
+[theme.sidebar]
+backgroundColor = "#182438"
+secondaryBackgroundColor = "#22324B"
+textColor = "#E8EDF5"
+primaryColor = "#8DB8F7"

@@ -4,6 +4,7 @@
 openai==3.31.0
 pydantic==2.14.1
 pydantic-settings==2.15.0
+PyYAML==6.0.2  # data-quality rule configuration (app/diagnostics/data_quality_engine.py); also a transitive dependency of langchain-core
 fastapi==0.143.2
 uvicorn==0.54.0
 pytest==9.1.1

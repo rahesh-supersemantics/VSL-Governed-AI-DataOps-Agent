@@ -19,6 +19,7 @@ from sqlalchemy import (
     inspect,
     or_,
     select,
+    text,
     update,
 )
 from sqlalchemy.dialects import mssql
@@ -57,6 +58,11 @@ def _rows(result) -> list[dict[str, Any]]:
 class SqlRepository:
     def __init__(self, engine: Engine):
         self.engine = engine
+
+    def current_database(self) -> str:
+        """The database the live connection is really on (read-only)."""
+        with self.engine.connect() as c:
+            return str(c.execute(text("SELECT DB_NAME()")).scalar_one())
 
     # ------------------------------------------------------------- state / baseline
     def get_state(self) -> dict | None:

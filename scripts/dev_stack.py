@@ -152,8 +152,8 @@ def recovery_status(auth: Mapping[str, str], api_port: int) -> tuple[bool | None
     info = data.get("recovery_unavailable") or {}
     if info.get("required_database_suffix"):
         return False, (f"UNAVAILABLE - recovery only runs on a database whose name ends with '{info['required_database_suffix']}' and this API "
-                       f"uses '{info.get('database')}'. Use a separate demo database, e.g. $env:DB_NAME = \"dataops_demo_test\" "
-                       "(README: 'Enable Human Review and recovery').")
+                       f"uses '{info.get('database')}'. Use a separate demo database and allowlist it, e.g. $env:DB_NAME = \"dataops_demo_test\"; "
+                       "$env:RECOVERY_TARGET_ALLOWLIST = \"dataops_demo_test\" (README: 'Enable Human Review and recovery').")
     return False, f"UNAVAILABLE - reason: {info.get('reason', 'unknown')}. {info.get('fix', '')}".strip()
 
 

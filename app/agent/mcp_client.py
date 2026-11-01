@@ -48,8 +48,8 @@ class McpUnavailable(Exception):
     """The MCP server could not be started or did not answer (message is safe to show)."""
 
 
-def default_server_params() -> StdioServerParameters:
-    return StdioServerParameters(command=sys.executable, args=["-m", "app.mcp_server"], cwd=str(PROJECT_ROOT))
+def default_server_params(module: str = "app.mcp_server") -> StdioServerParameters:
+    return StdioServerParameters(command=sys.executable, args=["-m", module], cwd=str(PROJECT_ROOT))
 
 
 def validate_arguments(spec: ToolSpec, arguments: Any) -> list[str]:
@@ -67,10 +67,10 @@ def validate_arguments(spec: ToolSpec, arguments: Any) -> list[str]:
     return problems
 
 
-def _result_shape_ok(name: str, data: Any) -> bool:
+def _result_shape_ok(name: str, data: Any, report_tools: frozenset[str] = REPORT_TOOLS) -> bool:
     if not isinstance(data, dict):
         return False
-    if name in REPORT_TOOLS:
+    if name in report_tools:
         results = data.get("results")
         return (isinstance(results, list) and data.get("overall_status") in _STATUSES
                 and all(isinstance(r, dict) and _RESULT_KEYS <= set(r) and r["status"] in _STATUSES for r in results))
@@ -80,8 +80,11 @@ def _result_shape_ok(name: str, data: Any) -> bool:
 class Toolbox:
     """Async context manager around one MCP client session."""
 
-    def __init__(self, target: Any = None, *, tool_timeout: float = 60.0, connect_timeout: float = 30.0):
+    def __init__(self, target: Any = None, *, tool_timeout: float = 60.0, connect_timeout: float = 30.0,
+                 approved_tools: frozenset[str] | None = None, report_tools: frozenset[str] | None = None):
         self._target = target if target is not None else default_server_params()
+        self._approved = frozenset(approved_tools) if approved_tools is not None else APPROVED_TOOLS
+        self._report_tools = frozenset(report_tools) if report_tools is not None else REPORT_TOOLS
         self._tool_timeout = tool_timeout
         self._connect_timeout = connect_timeout
         self._stack: AsyncExitStack | None = None
@@ -112,13 +115,13 @@ class Toolbox:
         self._stack = stack
         for tool in listed:
             read_only = bool(tool.annotations and tool.annotations.read_only_hint)
-            if tool.name in APPROVED_TOOLS and read_only:
+            if tool.name in self._approved and read_only:
                 self.tools[tool.name] = ToolSpec(name=tool.name, description=(tool.description or "").strip(),
                                                  input_schema=dict(tool.input_schema or {}),
                                                  output_schema=dict(tool.output_schema) if tool.output_schema else None)
             else:
                 self.ignored_tools.append(tool.name)
-        self.missing_tools = sorted(APPROVED_TOOLS - set(self.tools))
+        self.missing_tools = sorted(self._approved - set(self.tools))
         return self
 
     async def __aexit__(self, *exc_info: Any) -> None:
@@ -148,7 +151,7 @@ class Toolbox:
             if result.is_error:
                 return ToolOutcome(outcome="tool_error", detail=safe_text(text or "The tool reported an error.", 300))
             return ToolOutcome(outcome="malformed_response", detail="The tool returned no structured result.")
-        if not _result_shape_ok(name, data):
+        if not _result_shape_ok(name, data, self._report_tools):
             return ToolOutcome(outcome="malformed_response", detail="The structured result did not have the expected fields.")
-        failed = (data.get("overall_status") if name in REPORT_TOOLS else data.get("status")) == "error"
+        failed = (data.get("overall_status") if name in self._report_tools else data.get("status")) == "error"
         return ToolOutcome(outcome="diagnostic_error" if failed else "ok", structured=data)

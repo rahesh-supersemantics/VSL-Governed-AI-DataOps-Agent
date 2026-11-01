@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from app.agent.llm import Task
+
+if TYPE_CHECKING:
+    from app.agent.profiles import AgentProfile
 
 _STATUS_RANK = {"issue_detected": 0, "warning": 1}
 _SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
@@ -46,12 +49,20 @@ class OfflineHeuristicModel:
     mode: Literal["offline"] = "offline"
     name = "offline-heuristic"
 
+    def __init__(self, profile: "AgentProfile | None" = None) -> None:
+        """``profile=None`` keeps the original simulation behaviour exactly."""
+        self.profile = profile
+
     async def complete_json(self, task: Task, system: str, payload: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
         if task == "plan":
             return self._plan(payload)
         if task == "report":
             return self._report(payload)
         return {"ok": True}
+
+    @property
+    def _follows_runs(self) -> bool:
+        return self.profile.follows_run_references if self.profile else True
 
     # ------------------------------------------------------------------------------- planning
     def _plan(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -63,17 +74,17 @@ class OfflineHeuristicModel:
         wanted: list[tuple[str, dict[str, Any]]] = []
         if not executed:
             incident = payload.get("incident", "")
-            tools = ["get_pipeline_status"]
+            tools = [self.profile.first_tool if self.profile else "get_pipeline_status"]
             matched = False
-            for pattern, names in _KEYWORD_TOOLS:
+            for pattern, names in (self.profile.keyword_tools if self.profile else _KEYWORD_TOOLS):
                 if pattern.search(incident):
                     matched = True
                     tools += [n for n in names if n not in tools]
             if not matched:
-                tools = ["run_all_diagnostics"]
+                tools = [self.profile.sweep_tool if self.profile else "run_all_diagnostics"]
             wanted = [(t, {}) for t in tools]
             named: list[str] = []
-            for m in _RUN_IN_TEXT.finditer(incident):
+            for m in (_RUN_IN_TEXT.finditer(incident) if self._follows_runs else ()):
                 rid = m.group(0).rstrip(".-_")
                 if rid not in named:
                     named.append(rid)
@@ -82,7 +93,7 @@ class OfflineHeuristicModel:
                 "; the log of the run named in the incident is also inspected." if named else ".")
         else:
             run_ids: list[str] = []
-            for item in evidence:
+            for item in (evidence if self._follows_runs else ()):
                 if item["status"] in _STATUS_RANK:
                     for ref in item.get("affected_records", []):
                         m = _RUN_REF.match(ref)
@@ -94,7 +105,8 @@ class OfflineHeuristicModel:
         calls = [(t, a) for t, a in wanted if t in available and _key(t, a) not in done]
         confirmed = any(e["status"] == "issue_detected" for e in evidence)
         if executed and not calls and not confirmed:  # nothing new to follow up and nothing confirmed: widen the sweep
-            calls = [(t, a) for t, a in [("run_all_diagnostics", {})] if t in available and _key(t, a) not in done]
+            sweep = self.profile.sweep_tool if self.profile else "run_all_diagnostics"
+            calls = [(t, a) for t, a in [(sweep, {})] if t in available and _key(t, a) not in done]
             reason = "Targeted checks found no confirmed issue; widening to the full diagnostic sweep."
         if not calls:
             return {"action": "finish", "tool_calls": [], "rationale": "No further relevant diagnostics to run."}
@@ -114,7 +126,8 @@ class OfflineHeuristicModel:
         else:
             summary = f"{len(issues)} finding(s) across {len(evidence)} diagnostic result(s). Most significant: {issues[0]['summary']}"
 
-        if firm:
+        claims = self.profile.claims_root_cause if self.profile else True
+        if firm and claims:
             top = firm[0]
             same = [e for e in firm if e["error_code"] and e["error_code"] == top["error_code"]]
             cited = [top["evidence_id"]] + [e["evidence_id"] for e in same if e["evidence_id"] != top["evidence_id"]]
@@ -125,11 +138,14 @@ class OfflineHeuristicModel:
         else:
             cited = []
             root = {"statement": None, "evidence_ids": [],
-                    "explanation": "No diagnostic confirmed a failure, so no cause is supported by the evidence."}
-        hypotheses = [{"statement": f"Related finding that may be connected to the reported symptom: {e['summary']}",
+                    "explanation": ("No diagnostic confirmed a failure, so no cause is supported by the evidence." if not firm else
+                                    "The diagnostics report counts of rule violations. They establish what the database contains, "
+                                    "not why, so no root cause is claimed.")}
+        prefix = self.profile.hypothesis_prefix if self.profile else "Related finding that may be connected to the reported symptom: "
+        hypotheses = [{"statement": f"{prefix}{e['summary']}",
                        "evidence_ids": [e["evidence_id"]]} for e in issues if e["evidence_id"] not in cited][:3]
 
-        impact_item = next((e for e in issues if e["tool"] in _IMPACT_TOOLS), None)
+        impact_item = next((e for e in issues if e["tool"] in (self.profile.impact_tools if self.profile else _IMPACT_TOOLS)), None)
         impact = ({"statement": impact_item["summary"], "evidence_ids": [impact_item["evidence_id"]]}
                   if impact_item else {"statement": None, "evidence_ids": []})
 

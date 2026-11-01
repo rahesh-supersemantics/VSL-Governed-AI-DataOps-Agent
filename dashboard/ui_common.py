@@ -25,10 +25,39 @@ STATUS_BADGE = {"open": "red", "new": "blue", "investigating": "orange", "awaiti
 
 _CSS = """
 <style>
-.block-container {padding-top: 2.2rem; max-width: 1400px;}
-[data-testid="stMetric"] {background: rgba(128,128,128,.08); border-radius: .6rem; padding: .7rem .9rem;}
+:root {--navy:#182438; --ink:#1B2A3D; --muted:#51607A; --line:#C9D3E1; --blue:#3977D5; --green:#2B9B78; --amber:#D49B32; --red:#C94A4A;
+  --heading: Bahnschrift, "DIN Alternate", "Segoe UI", system-ui, sans-serif;}
+html, body, [data-testid="stAppViewContainer"] {font-family: "Segoe UI", system-ui, -apple-system, sans-serif;}
+.block-container {padding-top: 1.6rem; max-width: 1400px;}
+h1, h2, h3, .page-head h1 {font-family: var(--heading); letter-spacing: .005em; color: var(--ink);}
+/* page header */
+.page-head {border-bottom: 2px solid var(--navy); padding-bottom: .55rem; margin-bottom: 1rem;}
+.page-head h1 {font-size: 1.7rem; margin: 0; padding: 0;}
+.page-sub {color: var(--muted); margin: .2rem 0 0; max-width: 70ch; line-height: 1.4;}
+.page-note {display: block; color: var(--muted); font-size: .82rem; margin-top: .3rem;}
+/* KPI strip: metrics read as one connected strip with a left rule, not separate cards */
+[data-testid="stMetric"] {background: #fff; border: 1px solid var(--line); border-left: 4px solid var(--blue); border-radius: 2px; padding: .65rem .9rem;}
+[data-testid="stMetricValue"] {font-variant-numeric: tabular-nums; font-family: var(--heading);}
+[data-testid="stMetricLabel"] p {color: var(--muted);}
+/* status pills: glyph + text */
+.pill {display: inline-block; padding: .05rem .5rem; border-radius: 999px; font-size: .82rem; font-weight: 600; border: 1px solid currentColor; white-space: nowrap;}
+.pill-ok {color: #1D6F55; background: #E4F4EE;} .pill-warn {color: #7A5410; background: #FBF0D9;}
+.pill-bad {color: #9B2F2F; background: #FBE6E6;} .pill-info {color: #1F58A8; background: #E3EDFB;}
+.pill-hold {color: #4B3C8F; background: #ECE8FA;} .pill-neutral {color: #3F4C63; background: #EEF1F6;}
+/* certainty device: solid = observed, dashed = AI hypothesis, hatched = unavailable */
+.fact, .hypo, .unavailable, .empty-state {background: #fff; padding: .7rem 1rem; margin: .6rem 0; border-radius: 2px;}
+.fact {border: 1px solid var(--line); border-left: 5px solid var(--navy);}
+.hypo {border: 2px dashed #7C8CA6; border-left: 5px dashed var(--blue);}
+.unavailable {border: 1px solid var(--line); background: repeating-linear-gradient(135deg, #fff 0 9px, #EEF1F6 9px 11px);}
+.empty-state {border: 1px dashed var(--line); color: var(--muted);}
+.fact h3, .hypo h3 {margin: 0; font-size: 1.05rem;}
+.kind {color: var(--muted); font-size: .82rem; margin: .1rem 0 .3rem;}
+.fact ul, .hypo ul {margin: .2rem 0 0; padding-left: 1.2rem;}
 .demo-banner {border-left: .35rem solid #7c3aed; background: rgba(124,58,237,.10); padding: .5rem .8rem; border-radius: .3rem; margin-bottom: .6rem;}
-a:focus-visible, button:focus-visible {outline: 3px solid #2563eb !important; outline-offset: 2px;}
+[data-testid="stSidebar"] h1 {font-family: var(--heading); font-size: 1.3rem;}
+a:focus-visible, button:focus-visible, input:focus-visible, [role="radio"]:focus-visible, [data-baseweb="select"]:focus-within {outline: 3px solid #F2B84B !important; outline-offset: 2px;}
+@media (max-width: 640px) {.block-container {padding-left: .8rem; padding-right: .8rem;} .page-head h1 {font-size: 1.35rem;}}
+@media (prefers-reduced-motion: reduce) {* {transition: none !important; animation: none !important;}}
 </style>
 """
 

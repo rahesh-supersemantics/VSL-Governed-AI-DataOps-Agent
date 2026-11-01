@@ -22,11 +22,20 @@ import pandas as pd
 import streamlit as st
 
 from dashboard import charts, config, ops_data as d, runtime
+from dashboard.ui_kit import empty_state, fact_block, hypothesis_block, nav_group_css, page_header, pill, unavailable
 from dashboard.ui_common import apply_theme, badge, demo_banner, nav_links, pager, show_chart, show_problem, show_recovery_guidance, tone
 
-PAGES = ("Overview", "Incidents", "Investigations", "Human Review", "Recovery & approvals", "Pipelines & runs", "Tickets", "System status")
+# Option VALUES are stable identifiers (deep links and tests use them); NAV_LABELS are what people read. Order = grouping:
+# Monitor | Intelligence | Governance (existing safety workflows, kept) | System.
+PAGES = ("Overview", "Pipelines & runs", "Data Quality", "Incidents",
+         "Investigations", "Run History",
+         "Human Review", "Recovery & approvals", "Tickets",
+         "System status")
+NAV_LABELS = {"Pipelines & runs": "Pipelines", "Investigations": "AI Investigations", "System status": "Settings"}
+NAV_GROUPS = {1: "Monitor", 5: "Intelligence", 7: "Governance", 10: "System"}
 SRC_WF, SRC_SIM, SRC_DEMO = "Workflow incidents", "SQL Server simulator", "Synthetic demo (100)"
 ANY = "any"
+RUN_STATUSES = ("success", "warning", "failed", "running")  # the simulator schema CHECK; "partial" is not a valid status
 
 st.set_page_config(page_title="DataOps Operations Dashboard", page_icon=":material/monitoring:", layout="wide")
 client = runtime.ops_client()
@@ -68,7 +77,8 @@ def freshness(data: d.LoadedIncidents) -> None:
 st.sidebar.title("DataOps Operations")
 st.sidebar.caption("Operations Dashboard - read-only except approval decisions, starting investigations and importing simulator incidents via the API")
 nav_links(to_ledger=config.ledger_explorer_url())
-page = st.sidebar.radio("Page", PAGES, key="page")
+nav_group_css(NAV_GROUPS)
+page = st.sidebar.radio("Page", PAGES, key="page", format_func=lambda p: NAV_LABELS.get(p, p))
 if st.sidebar.button("Refresh data", key="refresh"):
     for key in ("loaded", "decision_result", "submitted"):
         st.session_state.pop(key, None)
@@ -132,12 +142,8 @@ def render_report(detail: dict) -> None:
     st.subheader(view["cause_label"])
     st.write(view["cause_statement"] or view["cause_explanation"])
     st.caption(f"Confidence: {view['confidence']} - {view['confidence_explanation']}")
-    st.subheader("Observed findings")
-    for s in view["observed"] or ["none recorded"]:
-        st.write(f"- {s}")
-    st.subheader(view["hypothesis_label"])
-    for s in view["hypotheses"] or ["none recorded"]:
-        st.write(f"- {s}")
+    fact_block("Observed findings", view["observed"])
+    hypothesis_block(view["hypothesis_label"], view["hypotheses"])
     with st.expander("Evidence"):
         st.dataframe(pd.DataFrame(view["evidence"] or [{"id": "none"}]), hide_index=True, width="stretch")
     with st.expander("Recommended next steps and limitations"):
@@ -270,7 +276,7 @@ def investigate_panel(workflow_id: str | None, *, sim_id: str | None = None) -> 
 
 # --------------------------------------------------------------------------------------------- overview
 if page == "Overview":
-    st.header("Overview")
+    page_header("Overview", "What is open, what needs a person, and how the pipelines are doing, from the live API.")
     freshness(data)
     metrics = d.overview_metrics(data)
     cols = st.columns(len(metrics))
@@ -294,10 +300,22 @@ if page == "Overview":
         tl = charts.timeline_chart(d.created_per_day(data.items))
         show_chart(st, tl, "No creation dates to chart.")
         st.caption("Charts use only the incidents loaded above. No history is inferred or filled in.")
+    st.subheader("Latest pipeline runs")
+    runs = client.simulator_runs(limit=100)
+    if not runs.ok:
+        unavailable("Run outcomes are unavailable",
+                    "The simulator run history comes from the SQL Server simulator, which this API cannot reach right now. No counts are shown rather than zeros.",
+                    how_to_fix="Check System status (Settings) for the simulator state.")
+    elif not runs.data["items"]:
+        empty_state("The simulator has no recorded runs.")
+    else:
+        counts = d.count_by(runs.data["items"], "status", ("success", "warning", "failed", "running"))
+        st.markdown(" &nbsp; ".join(f"{pill(k)} <strong>{v}</strong>" for k, v in counts), unsafe_allow_html=True)
+        st.caption(f"Counted over the {len(runs.data['items'])} most recent runs returned by the API (it returns at most 100). Open Run History for the rows.")
 
 # --------------------------------------------------------------------------------------------- incidents
 elif page == "Incidents":
-    st.header("Incident explorer")
+    page_header("Incidents", "Workflow, simulator and demonstration incidents, each kept in its own source.")
     source = st.radio("Source", [SRC_WF, SRC_SIM, SRC_DEMO], horizontal=True, key="inc_source",
                       help="Workflow = persisted investigations/approvals. Simulator = SQL Server dataops_sim. Demo = isolated synthetic data.")
     if source == SRC_SIM:
@@ -442,7 +460,7 @@ elif page == "Incidents":
 
 # --------------------------------------------------------------------------------------------- investigations
 elif page == "Investigations":
-    st.header("Investigation explorer")
+    page_header("AI investigations", "Observed facts and AI-generated hypotheses are kept apart. Nothing here runs a recovery.")
     ids = [i["incident_id"] for i in data.items]
     chosen = pick_incident("Incident", "inv_inc", ids)
     if chosen is None:
@@ -467,7 +485,7 @@ elif page == "Investigations":
 
 # --------------------------------------------------------------------------------------------- human review
 elif page == "Human Review":
-    st.header("Human Review")
+    page_header("Human Review", "Recovery proposals waiting for a person. Evidence, hypothesis, recommendation and decision are shown separately.")
     st.caption("Only items that are genuinely waiting for a human decision in the persisted approval workflow. Synthetic demo "
                "flags and simulator records never appear here. Approving does not bypass governance: execution still happens only "
                "inside the VSL-gated recovery workflow, and this page executes nothing itself.")
@@ -552,29 +570,69 @@ elif page == "Human Review":
 
 # --------------------------------------------------------------------------------------------- pipelines & runs
 elif page == "Pipelines & runs":
-    st.header("Pipelines and runs")
-    st.caption("Source: the SQL Server simulator (synthetic simulation data, read-only).")
+    page_header("Pipelines", "Pipeline definitions from the simulator.")
+    st.caption("Source: the SQL Server simulator (synthetic simulation data, read-only). Run outcomes are under Run History.")
     pl = client.simulator_pipelines()
     if not pl.ok:
         show_problem(pl.problem, "pipelines")
     elif not pl.data["items"]:
-        st.info("The simulator has no pipeline definitions.")
+        empty_state("The simulator has no pipeline definitions.")
     else:
         st.dataframe(pd.DataFrame(pl.data["items"]), hide_index=True, width="stretch")
-        a, b = st.columns(2)
+
+# --------------------------------------------------------------------------------------------- run history
+elif page == "Run History":
+    page_header("Run history", "Pipeline runs from the SQL Server simulator, newest first.")
+    pl = client.simulator_pipelines()
+    if not pl.ok:
+        show_problem(pl.problem, "pipelines")
+    else:
+        a, b, c = st.columns(3)
         pid = a.selectbox("Pipeline", [ANY, *[p["pipeline_id"] for p in pl.data["items"]]], key="run_pipe")
-        rst = b.selectbox("Run status", [ANY, "success", "failed", "partial", "running"], key="run_status")
-        runs = client.simulator_runs(pipeline_id=None if pid == ANY else pid, status=None if rst == ANY else rst, limit=50)
+        rst = b.selectbox("Run status", [ANY, *RUN_STATUSES], key="run_status")
+        lim = c.selectbox("Rows", [25, 50, 100], index=1, key="run_limit")
+        runs = client.simulator_runs(pipeline_id=None if pid == ANY else pid, status=None if rst == ANY else rst, limit=lim)
         if not runs.ok:
             show_problem(runs.problem, "runs")
         elif not runs.data["items"]:
-            st.info("No runs match the filters.")
+            empty_state("No runs match these filters.", "Choose another pipeline or status.")
         else:
-            st.dataframe(pd.DataFrame(runs.data["items"]), hide_index=True, width="stretch")
+            rows = runs.data["items"]
+            st.markdown(" &nbsp; ".join(f"{pill(k)} <strong>{v}</strong>" for k, v in d.count_by(rows, "status", RUN_STATUSES)), unsafe_allow_html=True)
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            st.caption(f"Showing up to {lim} runs. The API allows at most 100 and has no paging or date filter, so older runs cannot be reached from here.")
+
+# --------------------------------------------------------------------------------------------- data quality
+elif page == "Data Quality":
+    page_header("Data quality", "Validation outcomes the API exposes for simulator pipeline runs.")
+    unavailable("Rule results for the e-commerce dataset are not shown here",
+                "The e-commerce data-quality rules (including OLIST-008 and OLIST-009) run in the command line and the e-commerce MCP server. "
+                "The API has no endpoint for their results, so this page shows none and does not estimate any.")
+    st.subheader("Simulator validations")
+    sims = client.simulator_incidents(limit=100)
+    if not sims.ok:
+        show_problem(sims.problem, "simulator incidents")
+    elif not sims.data["items"]:
+        empty_state("The simulator has no incidents, so there are no validation records to show.")
+    else:
+        ids = [i["incident_id"] for i in sims.data["items"]]
+        sid = st.selectbox("Simulator incident", ids, key="dq_pick")
+        det = client.simulator_incident(sid)
+        if not det.ok:
+            show_problem(det.problem, "the simulator incident")
+        else:
+            vals = det.data.get("validations") or []
+            if not vals:
+                empty_state("This incident has no validation records.")
+            else:
+                st.markdown(" &nbsp; ".join(f"{pill(k)} <strong>{v}</strong>" for k, v in d.count_by(vals, "outcome", ("pass", "warn", "fail"))),
+                            unsafe_allow_html=True)
+                st.dataframe(pd.DataFrame(vals), hide_index=True, width="stretch")
+                st.caption("Confirmed simulator records, not an investigation result.")
 
 # --------------------------------------------------------------------------------------------- recovery & approvals
 elif page == "Recovery & approvals":
-    st.header("Recovery and approval monitoring")
+    page_header("Recovery and approvals", "Follow governed recovery requests. This page never runs or retries anything.")
     st.caption("Recovery runs only inside the governed Phase 7 workflow after a human approval. This page never executes or retries anything.")
     candidates = [i["incident_id"] for i in data.items if i.get("workflow_status") in d.RECOVERY_WORKFLOWS]
     if not data.available:
@@ -627,7 +685,7 @@ elif page == "Recovery & approvals":
 
 # --------------------------------------------------------------------------------------------- tickets
 elif page == "Tickets":
-    st.header("Ticketing")
+    page_header("Ticketing", "Tracker tickets linked to incidents. A closed ticket is not evidence of recovery.")
     rows = d.ticket_rows(data.items)
     if not data.available:
         st.info("Incidents are unavailable.")
@@ -652,7 +710,7 @@ elif page == "Tickets":
 
 # --------------------------------------------------------------------------------------------- status
 else:
-    st.header("Backend connectivity")
+    page_header("Settings", "Read-only connection details. Token values are never shown.")
     rows, warnings = d.status_rows(client.health(), client.ready())
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     for w in warnings:

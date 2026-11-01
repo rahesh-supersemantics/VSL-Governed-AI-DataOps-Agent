@@ -1,0 +1,27 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{py,yml,yaml}]
+indent_style = space
+
+[*.md]
+trim_trailing_whitespace = false
+
+[*.{ps1,bat,cmd}]
+end_of_line = crlf
+
+# Optional: Windows PowerShell 5.1 reads BOM-less files as ANSI. Today's only .ps1 is pure ASCII.
+# Drop this block if you only target PowerShell 7.
+[*.ps1]
+charset = utf-8-bom
+
+[*.{png,jpg,jpeg,gif,ico,zip}]
+charset = unset
+end_of_line = unset
+insert_final_newline = unset
+trim_trailing_whitespace = unset

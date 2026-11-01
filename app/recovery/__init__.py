@@ -10,6 +10,7 @@ from app.recovery.auth import (
     build_authenticator,
 )
 from app.recovery.reenable import ReEnablementService
+from app.recovery.risk_policy import POLICY_VERSION, RiskPolicy
 from app.recovery.runner import RecoveryRunner
 from app.recovery.workflow import (
     ProposedRecovery,
@@ -19,7 +20,7 @@ from app.recovery.workflow import (
     suggest_recovery,
 )
 
-__all__ = ["ACTIONS", "RECOVERY_ACTIONS", "ActionRejected", "ApprovalConfigError", "ApprovalDenied", "ApprovalService",
+__all__ = ["ACTIONS", "POLICY_VERSION", "RiskPolicy", "RECOVERY_ACTIONS", "ActionRejected", "ApprovalConfigError", "ApprovalDenied", "ApprovalService",
            "ApprovalSigner", "DenyAllAuthenticator", "Identity", "ProposedRecovery", "ReEnablementService",
            "RecoveryExecutor", "RecoveryOutcome", "RecoveryRunner", "RecoveryWorkflow", "SqliteApprovalStore",
            "StaticTokenAuthenticator", "build_authenticator", "proposal_from_report", "suggest_recovery",

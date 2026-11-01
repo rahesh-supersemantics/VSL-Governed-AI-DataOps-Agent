@@ -33,6 +33,7 @@ from app.governance.policy import ApprovalContext, GateInput, failed_preconditio
 from app.governance.workflow import GovernanceResult, GovernedActionService
 from app.recovery.actions import ActionRejected, ValidatedAction, validate_action
 from app.recovery.approvals import ApprovalDenied, ApprovalService, binding_digest
+from app.recovery.risk_policy import RiskPolicy
 from app.recovery.runner import RecoveryContext
 from app.simulation.scenarios import BY_ID, FAILURE_CODE_TO_SCENARIO
 
@@ -106,8 +107,9 @@ _UNUSABLE = {"rejected": "rejected", "expired": "expired", "cancelled": "cancell
 
 class RecoveryWorkflow:
     def __init__(self, approvals: ApprovalService, governed: GovernedActionService, recorder: GovernanceRecorder,
-                 *, checkpointer: Any = None) -> None:
+                 *, checkpointer: Any = None, risk_policy: RiskPolicy | None = None) -> None:
         self.approvals, self.governed, self.recorder = approvals, governed, recorder
+        self.risk_policy = risk_policy  # None = every action waits for a person
         self._checkpointer = checkpointer or InMemorySaver()
         self._threads: dict[str, str] = {}  # request_id -> thread id (in-process only; lost on restart)
         self.graph = self._build()
@@ -255,7 +257,27 @@ class RecoveryWorkflow:
     async def start(self, proposal: ProposedRecovery) -> RecoveryOutcome:
         """Validate the proposal and create an approval request, then pause for a human. Nothing is executed."""
         thread = "rec-" + uuid.uuid4().hex
-        return await self._run({"proposal": proposal, "decision_id": new_decision_id(), "entry_ids": []}, thread)
+        outcome = await self._run({"proposal": proposal, "decision_id": new_decision_id(), "entry_ids": []}, thread)
+        if outcome.awaiting_approval and outcome.request_id and self.risk_policy is not None:
+            outcome = await self._maybe_authorise_by_policy(outcome)
+        return outcome
+
+    async def _maybe_authorise_by_policy(self, outcome: RecoveryOutcome) -> RecoveryOutcome:
+        """Low-risk only, and only when the versioned policy says so. Any problem leaves the request waiting for a person.
+        The action still goes through the same VSL gates, approval validation, target checks and verification as a human-approved one."""
+        record = self.approvals.store.get(outcome.request_id or "")
+        if record is None:
+            return outcome
+        prior = self.approvals.count_policy_authorisations(record.incident_id, record.action_type, record.target,
+                                                           excluding=record.request_id)
+        decision = self.risk_policy.evaluate(record, prior_automatic=prior)
+        if not decision.allowed:
+            return outcome
+        try:
+            self.approvals.authorise_by_policy(record.request_id, decision)
+        except (ApprovalDenied, GovernanceLedgerError):
+            return outcome
+        return await self.resume(record.request_id)
 
     async def resume(self, request_id: str) -> RecoveryOutcome:
         """Re-evaluate a request after a human has (or has not) decided. Safe to call repeatedly: an approval

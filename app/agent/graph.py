@@ -26,6 +26,7 @@ from pydantic import ValidationError
 from app.agent.config import AgentConfig
 from app.agent.llm import FATAL_KINDS, PLAN_SCHEMA, REPORT_SCHEMA, ChatModel, LLMError
 from app.agent.mcp_client import Toolbox
+from app.agent.profiles import AgentProfile
 from app.agent.models import (
     EvidenceItem,
     InvestigationReport,
@@ -39,7 +40,7 @@ from app.agent.report import build_evidence, finalize_report
 from app.agent.safety import find_injection_markers, safe_text
 
 _OK_OUTCOMES = {"ok", "diagnostic_error"}
-_INFRA_CODES = {"DIAG-DB-ERROR", "DIAG-NOT-SEEDED"}
+_INFRA_CODES = {"DIAG-DB-ERROR", "DIAG-NOT-SEEDED", "ECOM-GUARD-REFUSED", "ECOM-DB-ERROR"}
 
 
 class AgentState(TypedDict, total=False):
@@ -68,6 +69,7 @@ class GraphDeps:
     toolbox: Toolbox
     config: AgentConfig
     progress: Callable[[str], None] = field(default=lambda _msg: None)
+    profile: AgentProfile | None = None  # None: the original simulation behaviour
 
 
 class ModelOutputInvalid(Exception):
@@ -115,7 +117,7 @@ def build_graph(deps: GraphDeps):
             tools=deps.toolbox.tools, executed=executed, evidence=[EvidenceItem(**e) for e in state.get("evidence", [])],
             budget_chars=cfg.max_prompt_evidence_chars)
         try:
-            decision: PlanDecision = await ask_model(deps, "plan", PLAN_SYSTEM, payload, PLAN_SCHEMA, PlanDecision)
+            decision: PlanDecision = await ask_model(deps, "plan", deps.profile.plan_system if deps.profile else PLAN_SYSTEM, payload, PLAN_SCHEMA, PlanDecision)
         except LLMError as exc:
             return {"stop_reason": "llm_error", "pending_calls": [], "error": {"kind": f"llm_{exc.kind}", "message": str(exc)}}
         except ModelOutputInvalid:
@@ -224,7 +226,7 @@ def build_graph(deps: GraphDeps):
                                      tool_runs=[{k: r.model_dump()[k] for k in ("call_id", "tool", "arguments", "outcome")} for r in runs],
                                      stop_reason=stop, budget_chars=cfg.max_prompt_evidence_chars)
             try:
-                draft = await ask_model(deps, "report", REPORT_SYSTEM, payload, REPORT_SCHEMA, ReportDraft)
+                draft = await ask_model(deps, "report", deps.profile.report_system if deps.profile else REPORT_SYSTEM, payload, REPORT_SCHEMA, ReportDraft)
             except LLMError as exc:
                 error = ReportError(kind=f"llm_{exc.kind}", message=str(exc))
             except ModelOutputInvalid:
@@ -242,7 +244,10 @@ def build_graph(deps: GraphDeps):
             investigation_id=state["investigation_id"], incident=state["incident"], mode=deps.llm.mode, model=deps.llm.name,
             tool_runs=runs, evidence=evidence, limitations=limitations, security_notes=state.get("security_notes", []),
             rounds_used=state["round"], tool_calls_used=state["tool_calls_used"], stop_reason=stop,
-            approved_tools=sorted(deps.toolbox.tools), draft=draft, error=error)
+            approved_tools=sorted(deps.toolbox.tools), draft=draft, error=error,
+            core_diagnostics=deps.profile.core_diagnostics if deps.profile else None,
+            incomplete_codes=deps.profile.incomplete_codes if deps.profile else None,
+            code_controlled=deps.profile.code_controlled_summary if deps.profile else False)
         return {"report": report.model_dump(mode="json")}
 
     def after_plan(state: AgentState) -> str:

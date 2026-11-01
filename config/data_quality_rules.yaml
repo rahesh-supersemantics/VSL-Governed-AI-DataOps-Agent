@@ -1,0 +1,123 @@
+version: 1
+database: dataops_ecommerce_demo
+
+execution:
+  mode: read_only
+  stop_on_error: false
+
+rules:
+  - id: OLIST-001
+    name: Orders have valid customer references
+    table: ecom_orders
+    type: foreign_key
+    column: customer_id
+    references:
+      table: ecom_customers
+      column: customer_id
+    severity: critical
+    enabled: true
+
+  - id: OLIST-002
+    name: Order items have valid order references
+    table: ecom_order_items
+    type: foreign_key
+    column: order_id
+    references:
+      table: ecom_orders
+      column: order_id
+    severity: critical
+    enabled: true
+
+  - id: OLIST-003
+    name: Order items have valid product references
+    table: ecom_order_items
+    type: foreign_key
+    column: product_id
+    references:
+      table: ecom_products
+      column: product_id
+    severity: high
+    enabled: true
+
+  - id: OLIST-004
+    name: Order items have valid seller references
+    table: ecom_order_items
+    type: foreign_key
+    column: seller_id
+    references:
+      table: ecom_sellers
+      column: seller_id
+    severity: high
+    enabled: true
+
+  - id: OLIST-005
+    name: Delivered orders have customer delivery dates
+    table: ecom_orders
+    type: conditional_not_null
+    column: order_delivered_customer_date
+    condition:
+      column: order_status
+      operator: equals
+      value: delivered
+    severity: high
+    enabled: true
+
+  - id: OLIST-006
+    name: Delivered orders have carrier delivery dates
+    table: ecom_orders
+    type: conditional_not_null
+    column: order_delivered_carrier_date
+    condition:
+      column: order_status
+      operator: equals
+      value: delivered
+    severity: medium
+    enabled: true
+
+  - id: OLIST-007
+    name: Delivery date is not before purchase
+    table: ecom_orders
+    type: column_comparison
+    left_column: order_delivered_customer_date
+    operator: greater_than_or_equal
+    right_column: order_purchase_timestamp
+    severity: high
+    enabled: true
+
+  - id: OLIST-008
+    name: Flag delivered orders later than estimated
+    table: ecom_orders
+    type: column_comparison
+    left_column: order_delivered_customer_date
+    operator: less_than_or_equal
+    right_column: order_estimated_delivery_date
+    condition:
+      column: order_status
+      operator: equals
+      value: delivered
+    severity: warning
+    classification: business_signal
+    enabled: true
+    notes: >
+      Late delivery is a business signal (service level), not data corruption.
+      Reported as flagged, never as an integrity failure.
+
+  - id: OLIST-009
+    name: Review IDs are unique
+    table: ecom_order_reviews
+    type: unique
+    columns:
+      - review_id
+    severity: warning
+    enabled: false
+    notes: >
+      Disabled pending investigation. Initial profiling found 789
+      duplicate review_id groups. Do not assume these records are corrupt.
+
+  - id: OLIST-010
+    name: Review IDs are not null
+    table: ecom_order_reviews
+    type: not_null
+    column: review_id
+    severity: high
+    enabled: true

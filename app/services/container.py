@@ -29,6 +29,7 @@ from app.recovery import (
     RecoveryExecutor,
     RecoveryRunner,
     RecoveryWorkflow,
+    RiskPolicy,
     SqliteApprovalStore,
     build_authenticator,
 )
@@ -53,6 +54,7 @@ class Services:
     recorder: GovernanceRecorder | None = None
     recoveries: RecoveryService | None = None
     recovery_unavailable: str | None = "not_configured"
+    recovery_detail: str | None = None       # why the target guard refused (a fixed, secret-free sentence)
     recovery_database: str | None = None     # name (never credentials) of the simulator database recovery was asked to use
     ticket_status: str = "not_configured"    # not_configured | configured | misconfigured
     throttle: AuthThrottle = field(default_factory=AuthThrottle)
@@ -111,7 +113,9 @@ def build_services(environ: Mapping[str, str] | None = None, settings: Settings 
     try:
         recorder = GovernanceRecorder(open_ledger(env.get("GOVERNANCE_LEDGER_PATH") or None))
         signer = ApprovalSigner.from_environ(env)
-        approvals = ApprovalService(SqliteApprovalStore(env.get("APPROVAL_STORE_PATH") or None), signer, authenticator, recorder)
+        risk_policy = RiskPolicy(enabled=settings.recovery_auto_authorize_low_risk)
+        approvals = ApprovalService(SqliteApprovalStore(env.get("APPROVAL_STORE_PATH") or None), signer, authenticator, recorder,
+                                    policy_checker=risk_policy.still_permits)
         services.recorder, services.approvals = recorder, approvals
     except Exception as exc:  # noqa: BLE001 - approvals/recovery stay off; the reason is a type name, never a value
         services.recovery_unavailable = "approvals_not_configured:" + type(exc).__name__
@@ -124,14 +128,16 @@ def build_services(environ: Mapping[str, str] | None = None, settings: Settings 
 
         sim = SimulationService(SqlRepository(make_engine(settings)), RunLogStore(Path(settings.sim_log_dir)),
                                 seed=settings.sim_seed, freshness_threshold_minutes=settings.freshness_threshold_minutes)
-        executor = RecoveryExecutor(sim)  # refuses any database that is not a *_test database (dataops_sim included)
+        executor = RecoveryExecutor(sim, settings.recovery_targets())  # refuses any database that is not a *_test database (dataops_sim included)
         governed = GovernedActionService(recorder, RecoveryRunner(executor, approvals, recorder), policy=build_policy(RECOVERY_ACTIONS))
-        services.recoveries = RecoveryService(store, RecoveryWorkflow(approvals, governed, recorder), approvals, recorder)
+        services.recoveries = RecoveryService(store, RecoveryWorkflow(approvals, governed, recorder, risk_policy=risk_policy), approvals, recorder)
         services.recovery_unavailable = None
         services.recoveries.reconcile_all()
     except Exception as exc:  # noqa: BLE001
         services.recovery_unavailable = "recovery_target_unavailable:" + type(exc).__name__
         services.recovery_database = settings.db_name
+        if type(exc).__name__ == "UnsafeRecoveryTarget":
+            services.recovery_detail = str(exc)[:200]  # a fixed sentence written in app.recovery.actions, never a value
     return services
 
 
@@ -143,9 +149,10 @@ def recovery_unavailable_info(services: Services) -> tuple[str, dict[str, Any]]:
     details: dict[str, Any] = {"reason": reason}
     if reason.endswith("UnsafeRecoveryTarget"):
         db = services.recovery_database or "the configured database"
-        details.update(database=services.recovery_database, required_database_suffix="_test",
-                       fix="Run the demo against a separate simulator database whose name ends with _test "
-                           "(for example DB_NAME=dataops_demo_test). See the README section 'Enable Human Review and recovery'.")
+        details.update(database=services.recovery_database, required_database_suffix="_test", why=getattr(services, "recovery_detail", None),
+                       fix="Run the demo against a separate simulator database whose name ends with _test AND list it in "
+                           "RECOVERY_TARGET_ALLOWLIST (for example DB_NAME=dataops_demo_test and "
+                           "RECOVERY_TARGET_ALLOWLIST=dataops_demo_test). See the README section 'Enable Human Review and recovery'.")
         return (f"Recovery and approvals are switched off by a safety guard: recovery may only run against a database whose name "
                 f"ends with '_test', and this API is using '{db}'. Nothing was changed.", details)
     if reason.startswith("approvals_not_configured"):

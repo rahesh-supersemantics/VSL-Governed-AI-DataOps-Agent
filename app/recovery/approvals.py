@@ -37,6 +37,7 @@ from typing import Any, Callable, Mapping
 from app.governance.ledger import GovernanceLedgerError, GovernanceRecorder
 from app.recovery.actions import ACTIONS, ActionRejected, ValidatedAction, validate_action
 from app.recovery.auth import ApprovalConfigError, Authenticator, Identity, is_permitted
+from app.recovery.risk_policy import POLICY_PRINCIPAL, POLICY_PRINCIPAL_PREFIX, PolicyDecision
 
 PENDING, APPROVED, REJECTED, EXPIRED, CANCELLED, CONSUMED = (
     "pending", "approved", "rejected", "expired", "cancelled", "consumed")
@@ -242,11 +243,12 @@ class ApprovalCheck:
 class ApprovalService:
     def __init__(self, store: SqliteApprovalStore, signer: ApprovalSigner, authenticator: Authenticator,
                  recorder: GovernanceRecorder, *, clock: Callable[[], datetime] = _utcnow,
-                 ttl: timedelta = DEFAULT_TTL) -> None:
+                 ttl: timedelta = DEFAULT_TTL, policy_checker: Callable[[ApprovalRecord], bool] | None = None) -> None:
         if not timedelta(0) < ttl <= MAX_TTL:
             raise ApprovalConfigError("approval ttl must be positive and at most 24 hours")
         self.store, self.signer, self.auth, self.recorder = store, signer, authenticator, recorder
         self.clock, self.ttl = clock, ttl
+        self.policy_checker = policy_checker  # re-validates a policy authorisation each time it is used
 
     # -- creation ------------------------------------------------------------------------------------
     def create_request(self, *, incident_id: str, action: ValidatedAction, evidence_refs: list[str] | tuple[str, ...],
@@ -293,6 +295,9 @@ class ApprovalService:
         if identity is None:
             self._note_attempt(record, "unauthenticated", None)
             raise ApprovalDenied("unauthenticated")
+        if identity.subject.startswith(POLICY_PRINCIPAL_PREFIX):  # a person can never present as the policy principal
+            self._note_attempt(record, "not_permitted", identity.subject)
+            raise ApprovalDenied("not_permitted")
         spec = ACTIONS.get(record.action_type)
         if spec is None or not is_permitted(identity.roles, spec.permission):
             self._note_attempt(record, "not_permitted", identity.subject)
@@ -353,6 +358,53 @@ class ApprovalService:
         assert updated is not None
         return updated
 
+    def authorise_by_policy(self, request_id: str, decision: PolicyDecision) -> ApprovalRecord:
+        """Record a POLICY authorisation (not a human one) for a pending request. Only a decision the versioned risk policy
+        allowed is accepted. It is bound, sealed, expiring and single-use exactly like a human approval, and it is recorded
+        in the ledger as ``approval_granted_by_policy`` with the policy version and rule so it can never be mistaken for a person."""
+        if not isinstance(request_id, str) or not _REQ_RE.match(request_id):
+            raise ApprovalDenied("not_found")
+        record = self.store.get(request_id)
+        if record is None:
+            raise ApprovalDenied("not_found")
+        if not decision.allowed or decision.risk != "low":
+            raise ApprovalDenied("policy_does_not_allow")
+        if self.policy_checker is None or not self.policy_checker(record):
+            raise ApprovalDenied("policy_does_not_allow")
+        if record.binding_digest != record.recomputed_digest():
+            raise ApprovalDenied("binding_mismatch")
+        now = self.clock()
+        if record.status != PENDING:
+            raise ApprovalDenied("not_pending", record.status)
+        if _ts(now) >= record.expires_at:
+            raise ApprovalDenied("expired")
+        decided_at = _ts(now)
+        fields = {"status": APPROVED, "decided_by": POLICY_PRINCIPAL, "decided_at": decided_at,
+                  "decision_reason": _clean(f"{decision.version} {decision.rule}", 300),
+                  "seal": self.signer.seal(request_id=request_id, digest=record.binding_digest, approver=POLICY_PRINCIPAL,
+                                           decided_at=decided_at, expires_at=record.expires_at, decision="approved")}
+        if not self.store.update_where(request_id, fields, "status = ? AND expires_at > ?", (PENDING, decided_at)):
+            raise ApprovalDenied("not_pending", "changed concurrently")
+        try:
+            entry = self.recorder.monitor(
+                decision_id=request_id, drift=False, caused_by=record.ledger_request_entry,
+                outcome="approval_granted_by_policy", request_id=request_id, approver=POLICY_PRINCIPAL,
+                policy_version=decision.version, policy_rule=decision.rule, risk_class=decision.risk,
+                binding_digest=record.binding_digest)
+            if not self.store.update_where(request_id, {"ledger_decision_entry": entry.entry_id}, "status = ?", (APPROVED,)):
+                raise GovernanceLedgerError("could not link the decision to its ledger entry")
+        except GovernanceLedgerError as exc:
+            self.store.update_where(request_id, {"status": PENDING, "seal": None, "decided_by": None, "decided_at": None},
+                                    "status = ? AND ledger_decision_entry IS NULL", (APPROVED,))
+            raise ApprovalDenied("ledger_error", type(exc).__name__) from exc
+        updated = self.store.get(request_id)
+        assert updated is not None
+        return updated
+
+    def count_policy_authorisations(self, incident_id: str, action_type: str, target: str, *, excluding: str = "") -> int:
+        return sum(1 for r in self.store.list() if r.request_id != excluding and r.incident_id == incident_id
+                   and r.action_type == action_type and r.target == target and r.decided_by == POLICY_PRINCIPAL)
+
     def cancel(self, request_id: str, credential: object, reason: str = "") -> ApprovalRecord:
         record, identity = self._authorise(request_id, credential)
         if record.status not in (PENDING, APPROVED):
@@ -390,7 +442,10 @@ class ApprovalService:
         if not record.ledger_decision_entry:
             return ApprovalCheck("invalid", "decision_not_recorded", record)
         spec = ACTIONS[record.action_type]
-        if not is_permitted(self.auth.current_roles(record.decided_by), spec.permission):
+        if record.decided_by.startswith(POLICY_PRINCIPAL_PREFIX):
+            if record.decided_by != POLICY_PRINCIPAL or self.policy_checker is None or not self.policy_checker(record):
+                return ApprovalCheck("invalid", "policy_no_longer_permits", record)
+        elif not is_permitted(self.auth.current_roles(record.decided_by), spec.permission):
             return ApprovalCheck("invalid", "approver_no_longer_permitted", record)
         try:
             if self._terminal_since(record.ledger_request_entry):

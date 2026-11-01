@@ -151,7 +151,9 @@ class OperationsStore:
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         with self._read() as conn:
             total = conn.execute(f"SELECT COUNT(*) FROM incidents{clause}", args).fetchone()[0]
-            rows = conn.execute(f"SELECT * FROM incidents{clause} ORDER BY created_at DESC, incident_id DESC LIMIT ? OFFSET ?",
+            # Newest first. created_at can be identical for incidents created within one clock tick (the Windows system
+            # clock advances in ~15 ms steps), so ties are broken by insertion order (rowid), never by the random incident_id.
+            rows = conn.execute(f"SELECT * FROM incidents{clause} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
                                 (*args, limit, offset)).fetchall()
         return [_row(r) for r in rows], int(total)
 
@@ -221,14 +223,14 @@ class OperationsStore:
 
     def list_investigations(self, incident_id: str) -> list[dict[str, Any]]:
         with self._read() as conn:
-            rows = conn.execute("SELECT * FROM investigations WHERE incident_id = ? ORDER BY created_at DESC, investigation_id DESC",
+            rows = conn.execute("SELECT * FROM investigations WHERE incident_id = ? ORDER BY created_at DESC, rowid DESC",
                                 (incident_id,)).fetchall()
         return [self._inv(_row(r)) for r in rows]
 
     def latest_completed_investigation(self, incident_id: str) -> dict[str, Any] | None:
         with self._read() as conn:
             return self._inv(_row(conn.execute(
-                "SELECT * FROM investigations WHERE incident_id=? AND status='completed' ORDER BY completed_at DESC, investigation_id DESC LIMIT 1",
+                "SELECT * FROM investigations WHERE incident_id=? AND status='completed' ORDER BY completed_at DESC, rowid DESC LIMIT 1",
                 (incident_id,)).fetchone()))
 
     @staticmethod
@@ -299,7 +301,7 @@ class OperationsStore:
 
     def list_recoveries(self, incident_id: str) -> list[dict[str, Any]]:
         with self._read() as conn:
-            rows = conn.execute("SELECT * FROM recoveries WHERE incident_id=? ORDER BY created_at DESC, recovery_id DESC", (incident_id,)).fetchall()
+            rows = conn.execute("SELECT * FROM recoveries WHERE incident_id=? ORDER BY created_at DESC, rowid DESC", (incident_id,)).fetchall()
         return [self._rec(_row(r)) for r in rows]
 
     def list_resuming(self) -> list[dict[str, Any]]:
@@ -321,7 +323,7 @@ class OperationsStore:
 
     def recent_recoveries(self, limit: int = 500) -> list[dict[str, Any]]:
         with self._read() as conn:
-            rows = conn.execute("SELECT * FROM recoveries ORDER BY created_at DESC, recovery_id DESC LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute("SELECT * FROM recoveries ORDER BY created_at DESC, rowid DESC LIMIT ?", (limit,)).fetchall()
         return [self._rec(_row(r)) for r in rows]
 
     def counts(self) -> dict[str, dict[str, int]]:

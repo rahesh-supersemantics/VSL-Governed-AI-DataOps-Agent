@@ -28,8 +28,14 @@ from typing import Any
 from vsl_core.exceptions import AutomationDeniedException
 
 from app.governance.ledger import GovernanceLedgerError, GovernanceRecorder
+from app.recovery.compensation import plan_for
 from app.recovery.actions import PreconditionFailed, RecoveryExecutor
 from app.recovery.approvals import ApprovalDenied, ApprovalService, validate_action_safely
+
+
+# After these the effect on state is wrong or unknown, so a person must take over. 'failed' (precondition) and 'blocked'
+# happen before any side effect and are not escalated.
+ESCALATING_STATUSES = frozenset({"verification_failed", "uncertain"})
 
 
 @dataclass(frozen=True)
@@ -43,6 +49,22 @@ class RecoveryContext:
 class RecoveryRunner:
     def __init__(self, executor: RecoveryExecutor, approvals: ApprovalService, recorder: GovernanceRecorder) -> None:
         self.executor, self.approvals, self.recorder = executor, approvals, recorder
+
+    def _escalate(self, record: Any, decision_id: str, cause_entry_id: str, status: str) -> list[str]:
+        """Record the design-only compensation plan and an explicit escalation. Never executes or retries anything."""
+        plan = plan_for(record.action_type, record.parameters)
+        try:
+            planned = self.recorder.monitor(
+                decision_id=decision_id, drift=False, caused_by=cause_entry_id, outcome="compensation_plan_proposed",
+                request_id=record.request_id, action=record.action_type, plan_status=plan.status,
+                technically_possible=plan.technically_possible, executable=False, automatic=False)
+            self.recorder.monitor(
+                decision_id=decision_id, drift=False, caused_by=planned.entry_id, outcome="recovery_escalated",
+                request_id=record.request_id, action=record.action_type, trigger=status,
+                next_step="a person reviews the actual state; automated recovery stopped; no retry")
+        except GovernanceLedgerError:
+            return ["escalation_record_failed"]
+        return ["escalated_to_human"]
 
     def execute(self, action: str, authorisation_entry_id: str, *, context: Any = None) -> dict[str, Any]:
         if not isinstance(context, RecoveryContext) or not authorisation_entry_id:
@@ -74,6 +96,8 @@ class RecoveryRunner:
                     return {"status": "succeeded_unrecorded", "reasons": ["result_record_failed", *reasons]}
                 if status == "uncertain":
                     return {"status": "uncertain", "reasons": ["result_record_failed", *reasons]}
+            if status in ESCALATING_STATUSES:  # the effect may have happened: plan (design only) + hand over to a person
+                reasons = [*reasons, *self._escalate(record, did, attempt.entry_id, status)]
             return {"status": status, "reasons": reasons}
 
         # 2. suspension re-check right before the side effect
