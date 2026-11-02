@@ -28,6 +28,7 @@ Honesty notes
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 from vsl_core.constructs import Invariant, PreNode, TerminalState
 from vsl_core.metrics import (
@@ -68,6 +69,70 @@ class ApprovalContext:
         return bool(self.approved_by.strip()) and self.approved_action == action
 
 
+# ---- evidence provenance and freshness (evidence-policy-v1)
+EVIDENCE_POLICY_VERSION = "evidence-policy-v1"
+# Only these evidence statuses can support a recovery: a diagnostic observed a problem. "ok" (nothing found) and "error"
+# (the check did not work) are facts, but they cannot justify changing anything.
+SUPPORTING_EVIDENCE_STATUSES = frozenset({"issue_detected", "warning"})
+CLOCK_SKEW = timedelta(seconds=60)
+
+
+@dataclass(frozen=True)
+class EvidenceMeta:
+    """Explicit metadata of one evidence item. It describes a tool observation, never model text."""
+
+    evidence_id: str
+    tool: str                       # the diagnostic that produced it
+    status: str                     # as reported by that diagnostic
+    collected_at: str               # ISO-8601 with a UTC offset, stamped by code when the result arrived
+    investigation_id: str = ""      # the investigation the item belongs to
+
+
+@dataclass(frozen=True)
+class EvidencePolicy:
+    """What counts as acceptable evidence for a protected action. Documented in docs/governance-evidence-policy.md."""
+
+    known_tools: frozenset[str]
+    max_age: timedelta = timedelta(minutes=60)
+    version: str = EVIDENCE_POLICY_VERSION
+
+
+def _parse_utc(value: str) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return moment.astimezone(timezone.utc) if moment.tzinfo is not None else None  # a time without an offset is unverifiable
+
+
+def evidence_failures(cited: tuple[str, ...], meta: tuple[EvidenceMeta, ...], policy: EvidencePolicy, *,
+                      now: datetime | None, investigation_id: str | None) -> tuple[str, ...]:
+    """Reasons the cited evidence is not acceptable (empty = acceptable). Missing or unverifiable data is a failure, never a pass."""
+    if now is None or now.tzinfo is None:
+        return ("evidence_check_time_unavailable",)
+    by_id = {m.evidence_id: m for m in meta}
+    failed: set[str] = set()
+    for ref in cited:
+        item = by_id.get(ref)
+        if item is None:
+            failed.add("evidence_metadata_missing")
+            continue
+        if item.tool not in policy.known_tools:
+            failed.add("evidence_source_unverified")
+        if item.status not in SUPPORTING_EVIDENCE_STATUSES:
+            failed.add("evidence_does_not_support_action")
+        if investigation_id and item.investigation_id != investigation_id:
+            failed.add("evidence_from_other_investigation")
+        when = _parse_utc(item.collected_at)
+        if when is None:
+            failed.add("evidence_timestamp_invalid")
+        elif when - now.astimezone(timezone.utc) > CLOCK_SKEW:
+            failed.add("evidence_timestamp_in_future")
+        elif now.astimezone(timezone.utc) - when > policy.max_age:
+            failed.add("evidence_stale")
+    return tuple(sorted(failed))
+
+
 @dataclass(frozen=True)
 class GateInput:
     """Everything a gate may look at. All of it is verifiable data; none of it is model confidence."""
@@ -81,6 +146,12 @@ class GateInput:
     # Opaque, caller-built data handed to the action runner (never read by a gate). Phase 7 puts the
     # validated request id and parameters here.
     context: object | None = None
+    # Evidence provenance/freshness. When ``evidence_policy`` is set (every recovery path sets it) the cited evidence must
+    # also satisfy it. ``evidence_policy=None`` keeps the original Phase 6 behaviour for callers that do not use evidence metadata.
+    evidence: tuple[EvidenceMeta, ...] = ()
+    evidence_policy: EvidencePolicy | None = None
+    investigation_id: str | None = None
+    evaluated_at: datetime | None = None
 
 
 def failed_preconditions(candidate: GateInput) -> tuple[str, ...]:
@@ -92,6 +163,9 @@ def failed_preconditions(candidate: GateInput) -> tuple[str, ...]:
     cited = candidate.cited_evidence_ids
     if not cited or not all(item in known for item in cited):
         failed.append("evidence_not_cited_or_unknown")
+    if candidate.evidence_policy is not None:
+        failed.extend(evidence_failures(candidate.cited_evidence_ids, candidate.evidence, candidate.evidence_policy,
+                                        now=candidate.evaluated_at, investigation_id=candidate.investigation_id))
     if candidate.approval is None or not candidate.approval.is_valid_for(candidate.action):
         failed.append("approval_missing_or_mismatched")
     return tuple(failed)

@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from app.governance.ledger import GovernanceLedgerError, GovernanceRecorder
+from app.governance.policy import EvidenceMeta
 from app.recovery.actions import ACTIONS, ActionRejected, ValidatedAction, validate_action
 from app.recovery.auth import ApprovalConfigError, Authenticator, Identity, is_permitted
 from app.recovery.risk_policy import POLICY_PRINCIPAL, POLICY_PRINCIPAL_PREFIX, PolicyDecision
@@ -184,6 +185,32 @@ def _from_row(row: sqlite3.Row) -> ApprovalRecord:
         ledger_request_entry=values["ledger_request_entry"], ledger_decision_entry=values["ledger_decision_entry"])
 
 
+# Additive tables (CREATE IF NOT EXISTS: no ALTER, existing files keep working).
+_EVIDENCE_SCHEMA = """CREATE TABLE IF NOT EXISTS approval_evidence (
+    request_id TEXT PRIMARY KEY, investigation_id TEXT NOT NULL, evidence_json TEXT NOT NULL, recorded_at TEXT NOT NULL)"""
+# One row per attempt to run an operation. A partial unique index lets at most one 'claimed' or 'uncertain' row exist per key.
+_CLAIM_SCHEMA = """CREATE TABLE IF NOT EXISTS execution_claims (
+    claim_id INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key TEXT NOT NULL, request_id TEXT NOT NULL UNIQUE,
+    decision_id TEXT NOT NULL, state TEXT NOT NULL, claimed_at TEXT NOT NULL, finished_at TEXT)"""
+_CLAIM_INDEX = """CREATE UNIQUE INDEX IF NOT EXISTS one_open_claim_per_key ON execution_claims(idempotency_key)
+    WHERE state IN ('claimed', 'uncertain')"""
+CLAIM_BLOCKING_STATES = ("claimed", "uncertain")
+
+
+def evidence_digest(meta: "tuple[EvidenceMeta, ...]") -> str:
+    """Tamper-evidence for the stored evidence metadata. The digest is written into the hash-chained ledger when the request is
+    made and recomputed from the stored rows before execution, so editing a row afterwards is detected. It proves the rows are
+    unchanged since the request was made; it does not prove the original timestamps were truthful or signed."""
+    rows = sorted([m.evidence_id, m.tool, m.status, m.collected_at, m.investigation_id] for m in meta)
+    return "evd-" + hashlib.sha256(canonical_json(rows).encode("utf-8")).hexdigest()[:40]
+
+
+def idempotency_key(incident_id: str, action_type: str, parameters: Mapping[str, Any], target: str) -> str:
+    """Stable identity of an OPERATION: the same incident, action, parameters and target always give the same key, whatever the
+    request id, evidence or time. It is derived (never supplied by a caller) and is recorded in the ledger."""
+    return "idem-" + hashlib.sha256(canonical_json([incident_id, action_type, dict(parameters), target]).encode()).hexdigest()[:40]
+
+
 class SqliteApprovalStore:
     """One short-lived connection per call; writes use ``BEGIN IMMEDIATE`` so they serialise across processes."""
 
@@ -192,6 +219,9 @@ class SqliteApprovalStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as conn:
             conn.execute(_SCHEMA)
+            conn.execute(_EVIDENCE_SCHEMA)
+            conn.execute(_CLAIM_SCHEMA)
+            conn.execute(_CLAIM_INDEX)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
@@ -208,6 +238,63 @@ class SqliteApprovalStore:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(f"INSERT INTO approval_requests ({','.join(_COLUMNS)}) VALUES ({','.join('?' * len(_COLUMNS))})", values)
             conn.execute("COMMIT")
+
+    # -- evidence metadata (bound to the request at creation, re-read at execution)
+    def put_evidence(self, request_id: str, investigation_id: str, meta: tuple[EvidenceMeta, ...], recorded_at: str) -> None:
+        payload = canonical_json([[m.evidence_id, m.tool, m.status, m.collected_at, m.investigation_id] for m in meta])
+        with closing(self._connect()) as conn:
+            conn.execute("INSERT OR IGNORE INTO approval_evidence (request_id, investigation_id, evidence_json, recorded_at) VALUES (?,?,?,?)",
+                         (request_id, investigation_id, payload, recorded_at))
+
+    def get_evidence(self, request_id: str) -> tuple[str, tuple[EvidenceMeta, ...]] | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT investigation_id, evidence_json FROM approval_evidence WHERE request_id = ?", (request_id,)).fetchone()
+        if row is None:
+            return None
+        return row["investigation_id"], tuple(EvidenceMeta(*item) for item in json.loads(row["evidence_json"]))
+
+    # -- execution claims (idempotency)
+    def claim_execution(self, key: str, request_id: str, decision_id: str, now: str) -> bool:
+        """Atomically claim the right to run this operation. False if the same operation is in flight or has an unreconciled
+        uncertain outcome. The unique index makes this safe across threads and processes."""
+        with closing(self._connect()) as conn:
+            try:
+                conn.execute("INSERT INTO execution_claims (idempotency_key, request_id, decision_id, state, claimed_at) VALUES (?,?,?, 'claimed', ?)",
+                             (key, request_id, decision_id, now))
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def finish_claim(self, request_id: str, state: str, now: str) -> bool:
+        """claimed -> succeeded | failed | uncertain, or 'released' (nothing was done). Only an open claim can change."""
+        if state not in ("succeeded", "failed", "uncertain", "released"):
+            raise ValueError("unknown claim state")
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute("UPDATE execution_claims SET state = ?, finished_at = ? WHERE request_id = ? AND state IN ('claimed')",
+                               (state, now, request_id))
+            conn.execute("COMMIT")
+            return cur.rowcount == 1
+
+    def mark_claim_uncertain(self, request_id: str, now: str) -> bool:
+        return self.finish_claim(request_id, "uncertain", now)
+
+    def claim_state(self, request_id: str) -> str | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT state FROM execution_claims WHERE request_id = ?", (request_id,)).fetchone()
+        return row["state"] if row else None
+
+    def open_claim_for_key(self, key: str) -> dict[str, Any] | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT request_id, decision_id, state, claimed_at FROM execution_claims WHERE idempotency_key = ? AND state IN ('claimed','uncertain')", (key,)).fetchone()
+        return dict(row) if row else None
+
+    def release_uncertain(self, key: str, now: str) -> bool:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute("UPDATE execution_claims SET state = 'reconciled', finished_at = ? WHERE idempotency_key = ? AND state = 'uncertain'", (now, key))
+            conn.execute("COMMIT")
+            return cur.rowcount == 1
 
     def get(self, request_id: str) -> ApprovalRecord | None:
         with closing(self._connect()) as conn:
@@ -253,7 +340,8 @@ class ApprovalService:
     # -- creation ------------------------------------------------------------------------------------
     def create_request(self, *, incident_id: str, action: ValidatedAction, evidence_refs: list[str] | tuple[str, ...],
                        reason: str, governance_state: str, report_status: str, requested_by: str = "agent",
-                       caused_by: str | None = None, decision_id: str | None = None) -> ApprovalRecord:
+                       caused_by: str | None = None, decision_id: str | None = None, evidence_meta: tuple[EvidenceMeta, ...] = (),
+                       investigation_id: str = "") -> ApprovalRecord:
         if not isinstance(incident_id, str) or not _ID_RE.match(incident_id):
             raise ApprovalDenied("invalid_incident_id")
         refs = tuple(evidence_refs)
@@ -279,9 +367,12 @@ class ApprovalService:
         entry = self.recorder.monitor(decision_id=decision_id or request_id, drift=False, caused_by=caused_by,
                                       outcome="approval_requested", request_id=request_id, action=action.action_type,
                                       target=action.target, risk=action.risk, binding_digest=record.binding_digest,
-                                      expires_at=record.expires_at)
+                                      expires_at=record.expires_at,
+                                      idempotency_key=idempotency_key(incident_id, action.action_type, action.parameters, action.target),
+                                      evidence_digest=evidence_digest(tuple(evidence_meta)))
         record = replace(record, ledger_request_entry=entry.entry_id)
         self.store.insert(record)
+        self.store.put_evidence(request_id, investigation_id, tuple(evidence_meta), _ts(now))
         return record
 
     # -- decisions -----------------------------------------------------------------------------------
@@ -303,6 +394,20 @@ class ApprovalService:
             self._note_attempt(record, "not_permitted", identity.subject)
             raise ApprovalDenied("not_permitted")
         return record, identity
+
+    def reconcile_uncertain(self, request_id: str, credential: object, reason: str) -> None:
+        """A person confirms they have checked the real state after an UNCERTAIN outcome, which re-opens that operation to a new
+        request. It needs the same permission as approving that action. It executes nothing, and there is deliberately no
+        HTTP route for it yet (a person with service access only)."""
+        record, identity = self._authorise(request_id, credential)
+        if self.store.claim_state(request_id) != "uncertain":
+            raise ApprovalDenied("not_uncertain")
+        key = idempotency_key(record.incident_id, record.action_type, record.parameters, record.target)
+        if not self.store.release_uncertain(key, _ts(self.clock())):
+            raise ApprovalDenied("not_uncertain")
+        self.recorder.monitor(decision_id=record.request_id, drift=False, caused_by=record.ledger_request_entry,
+                              outcome="idempotency_claim_reconciled", request_id=request_id, idempotency_key=key,
+                              reviewer=_clean(identity.subject, 64), reason=_clean(reason, 200))
 
     def _note_attempt(self, record: ApprovalRecord, code: str, subject: str | None) -> None:
         try:

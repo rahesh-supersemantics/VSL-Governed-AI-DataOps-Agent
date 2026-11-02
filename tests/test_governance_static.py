@@ -49,7 +49,7 @@ def test_no_handler_can_swallow_automation_denied_exception():
 
 def test_policy_imports_only_vsl_core_and_the_standard_library():
     mods = imported_modules(parse(GOV / "policy.py"))
-    allowed_roots = {"__future__", "dataclasses", "vsl_core"}
+    allowed_roots = {"__future__", "dataclasses", "datetime", "vsl_core"}  # datetime: stdlib, for the evidence freshness rule
     assert {m.split(".")[0] for m in mods} <= allowed_roots
 
 

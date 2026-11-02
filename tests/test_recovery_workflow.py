@@ -87,7 +87,7 @@ def test_an_approved_request_executes_exactly_once_after_all_gates_pass(tmp_path
     assert env.executor.count == 1 and runs(env) == before + 1
     assert env.store.get(out.request_id).status == "consumed"
     assert kinds(env) == ["recovery_proposed", "approval_requested", "approval_granted", "authorised",
-                          "recovery_attempt", "recovery_succeeded", "executed"]
+                          "recovery_attempt", "idempotency_claim_acquired", "recovery_succeeded", "executed"]
     assert env.recorder.ledger.verify_integrity() and env.recorder.ledger.audit().all_passed
 
 
@@ -311,8 +311,8 @@ def test_a_failed_precondition_runs_nothing_and_keeps_the_approval_unspent(tmp_p
 def test_a_result_record_failure_after_success_is_reported_honestly(tmp_path):
     env, out = paused(tmp_path)
     approve(env, out.request_id)
-    # authorised + attempt are written, then the result record and later records fail
-    env.recorder.ledger.store = FailingStore(env.recorder.ledger.store, allow=2)
+    # authorised + attempt + claim entry are written, then the result record and later records fail
+    env.recorder.ledger.store = FailingStore(env.recorder.ledger.store, allow=3)
     done = resume(env, out)
     assert done.status == "governance_error" and done.execution_status == "succeeded_unrecorded"
     assert env.executor.count == 1  # the effect really happened, and the outcome says so

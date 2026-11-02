@@ -12,7 +12,10 @@ mapping is. Where the application has no such state, ``STATE_MAP`` says so inste
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
+
+from app.recovery.expiry import is_expired
 
 LOGICAL_STATES = ("Investigating", "Proposed", "PendingReview", "Authorized", "ReadyToExecute", "Executing", "Succeeded",
                   "Failed", "OutcomeUnknown", "Rejected", "Expired", "Compensating", "Compensated", "Escalated")
@@ -36,7 +39,7 @@ STATE_MAP: dict[str, tuple[str, str, str]] = {
     "Rejected": ("approximate", "rejected, action_rejected, denied_human_review, cancelled, blocked, approval_invalid, "
                                 "approval_already_used, refused_suspended, terminal_suspended",
                  "Several different stored reasons collapse into this logical state; the stored reason is always shown."),
-    "Expired": ("direct", "approval/recovery status = expired", ""),
+    "Expired": ("direct", "approval/recovery status = expired; shown as Expired (derived) when a pending approval is past expires_at", ""),
     "Compensating": ("not_stored", "not implemented", "By decision only a design-only compensation plan is produced; no compensating step runs."),
     "Compensated": ("not_stored", "not implemented", "Same as Compensating."),
     "Escalated": ("derived", "a 'recovery_escalated' ledger entry exists",
@@ -47,14 +50,19 @@ _REJECTED = {"rejected", "action_rejected", "denied_human_review", "cancelled", 
              "approval_invalid", "approval_already_used", "refused_suspended", "terminal_suspended"}
 
 
-def logical_state(recovery: dict[str, Any], approval: dict[str, Any] | None, *, escalated: bool = False) -> dict[str, str]:
-    """{'state', 'stored_status', 'exactness', 'note'} for one recovery."""
+def logical_state(recovery: dict[str, Any], approval: dict[str, Any] | None, *, escalated: bool = False,
+                  now: datetime | None = None) -> dict[str, str]:
+    """{'state', 'stored_status', 'exactness', 'note'} for one recovery. ``now`` lets a pending request past its expiry read
+    as Expired (derived, nothing is stored); without it the stored status is used unchanged."""
     status = str(recovery.get("status", ""))
     verified = str(recovery.get("verified_outcome", ""))
     base: tuple[str, str, str]
     if status == "awaiting_approval":
         approved = bool(approval) and approval.get("status") == "approved"
-        base = ("Authorized", "derived", "approved but not yet spent") if approved else ("PendingReview", "direct", "")
+        if now is not None and is_expired(approval, now):
+            base = ("Expired", "derived", "the approval request passed its expiry before any decision; the stored status is still pending")
+        else:
+            base = ("Authorized", "derived", "approved but not yet spent") if approved else ("PendingReview", "direct", "")
     elif status == "resuming":
         base = ("Executing", "direct", "")
     elif status == "executed":
@@ -77,3 +85,19 @@ def logical_state(recovery: dict[str, Any], approval: dict[str, Any] | None, *, 
         return {"state": "Escalated", "stored_status": status, "exactness": "derived",
                 "note": f"escalated to a person after: {state}" + (f" ({note})" if note else "")}
     return {"state": state, "stored_status": status, "exactness": exactness, "note": note}
+
+
+# ---- stored-status transitions (documentation of what the persistence layer enforces; tests prove they agree)
+ACTIVE_STATUSES = ("awaiting_approval", "resuming")
+FINAL_STATUSES = ("executed", "recovery_uncertain", "recovery_failed", "recovery_verification_failed", "governance_error", "expired",
+                  *sorted(_REJECTED))
+
+
+def transition_allowed(previous: str, new: str) -> bool:
+    """True when the store lets a recovery row move from ``previous`` to ``new``. A final status is never reopened or rewritten;
+    ``resuming`` is only entered from ``awaiting_approval`` by the atomic claim, and only released back when nothing executed."""
+    if previous not in ACTIVE_STATUSES:
+        return False
+    if new == "resuming":
+        return previous == "awaiting_approval"
+    return True  # active -> active release (resuming -> awaiting_approval) or active -> any final status

@@ -52,7 +52,7 @@ def _item(evidence_id: str, call_id: str, data: dict[str, Any], limit: int) -> E
         summary=safe_text(data.get("summary"), 500), error_code=safe_text(data["error_code"], 40) if data.get("error_code") else None,
         recommended_next_step=safe_text(data["recommended_next_step"], 400) if data.get("recommended_next_step") else None,
         affected_records=[safe_text(r, 100) for r in (data.get("affected_records") or [])[:25]],
-        digest=digest, truncated=truncated)
+        digest=digest, truncated=truncated, collected_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
 
 def build_evidence(call_id: str, structured: dict[str, Any], limit: int) -> list[EvidenceItem]:

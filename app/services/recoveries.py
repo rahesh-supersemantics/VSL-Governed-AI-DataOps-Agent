@@ -14,11 +14,14 @@ row cannot cause an execution, because the approval store and the VSL gates deci
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from app.agent.models import InvestigationReport
 from app.governance.ledger import GovernanceLedgerError, GovernanceRecorder
 from app.persistence import OperationsStore, RecoveryActive
+from app.recovery.governance_view import build_governance_view
+from app.recovery.prenode_verdicts import SAFE_KEYS
 from app.recovery import ApprovalDenied, ApprovalService, RecoveryOutcome, RecoveryWorkflow, proposal_from_report, suggest_recovery
 
 __all__ = ["NoRecoverySuggested", "RecoveryActive", "RecoveryService", "RecoveryUnavailable"]
@@ -121,15 +124,17 @@ class RecoveryService:
             return row
         record = self.approvals.store.get(row["approval_request_id"]) if row["approval_request_id"] else None
         if record is not None and record.status == "consumed":
+            escalation = "escalated_to_human"
             try:  # best effort: the status below is the source of truth even if the ledger cannot be written
                 self.recorder.monitor(decision_id=row["decision_id"] or record.request_id, drift=False, outcome="recovery_escalated",
                                       request_id=record.request_id, action=record.action_type, trigger="interrupted_before_result_recorded",
                                       next_step="a person reviews the actual state; automated recovery stopped; no retry")
             except GovernanceLedgerError:
-                pass
+                escalation = "escalation_record_failed"  # reported, not hidden
+            self.approvals.store.mark_claim_uncertain(record.request_id, datetime.now(timezone.utc).isoformat(timespec="seconds"))
             self.store.record_recovery_outcome(
                 row["recovery_id"], status="recovery_uncertain", execution_status="uncertain",
-                reasons=["interrupted_before_result_recorded"], verified_outcome="unknown", started=True,
+                reasons=["interrupted_before_result_recorded", escalation], verified_outcome="unknown", started=True,
                 ledger_entry_ids=row["ledger_entry_ids"])
         else:
             self.store.release_recovery_claim(row["recovery_id"])
@@ -160,6 +165,27 @@ class RecoveryService:
             return []
         return [{"entry_id": e.entry_id, "outcome": e.payload.get("outcome"), "type": e.entry_type.value, "caused_by": e.caused_by}
                 for e in entries]
+
+    def governance_payloads(self, entry_ids: list[str], request_id: str | None = None, decision_id: str | None = None) -> list[dict[str, Any]]:
+        """The same ledger entries as ``governance_events`` but with a whitelist of payload fields (no free text), in ledger order."""
+        wanted = set(entry_ids)
+        if request_id:
+            record = self.approvals.store.get(request_id)
+            if record is not None:
+                wanted |= {x for x in (record.ledger_request_entry, record.ledger_decision_entry) if x}
+        try:
+            entries = [e for e in self.recorder.ledger.store.all_entries() if e.entry_id in wanted or (decision_id and getattr(e, "decision_id", None) == decision_id)]
+        except Exception:  # noqa: BLE001 - an unreadable ledger must not break a read endpoint; verdicts then read 'not_recorded'
+            return []
+        return [{k: e.payload.get(k) for k in SAFE_KEYS if k in e.payload} for e in entries]
+
+    def governance_view(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Read-only: stored state plus ledger outcomes, never an execution (see app.recovery.governance_view)."""
+        approval = self.approval_summary(row["approval_request_id"]) if row.get("approval_request_id") else None
+        events = self.governance_events(row["ledger_entry_ids"], row.get("approval_request_id"), row.get("decision_id"))
+        investigation = self.store.get_investigation(row["investigation_id"]) if row.get("investigation_id") else None
+        payloads = self.governance_payloads(row["ledger_entry_ids"], row.get("approval_request_id"), row.get("decision_id"))
+        return build_governance_view(row, approval, events, investigation, payloads, now=self.approvals.clock())
 
 
 def denial_status(code: str) -> int:

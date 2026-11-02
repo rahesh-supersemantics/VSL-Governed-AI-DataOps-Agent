@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Outcome = Literal["ok", "diagnostic_error", "tool_error", "invalid_arguments", "timeout", "malformed_response",
                   "connection_error", "not_approved", "budget_exceeded", "duplicate_skipped", "skipped"]
@@ -57,11 +58,36 @@ class EvidenceItem(BaseModel):
     affected_records: list[str] = Field(default_factory=list)
     digest: dict[str, Any] = Field(default_factory=dict)
     truncated: bool = False
+    collected_at: str | None = None  # ISO-8601 UTC, stamped by code when the tool result arrived (never by a model)
+
+
+_CERTAIN = re.compile(r"\b(confirmed|definitely|certainly|proven|proved|undoubtedly|without doubt|for sure|conclusively)\b", re.I)
+_HEDGED = re.compile(r"\b(might|may|possibly|perhaps|probably|likely|could be|suggests?|appears?|seems?)\b", re.I)
+
+
+def review_reasons(kind: str, statement: str, evidence_statuses: list[str]) -> list[str]:
+    """Deterministic screen only. Keyword checks cannot establish that wording is semantically right; they flag the obvious cases
+    for a person instead of silently trusting the model's phrasing."""
+    reasons: list[str] = []
+    if kind == "hypothesis" and _CERTAIN.search(statement or ""):
+        reasons.append("hypothesis_uses_certainty_language")
+    if kind == "observed" and _HEDGED.search(statement or ""):
+        reasons.append("observed_uses_hedged_language")
+    if kind == "observed" and evidence_statuses and all(s == "error" for s in evidence_statuses):
+        reasons.append("observed_cites_only_failed_tool_evidence")
+    return reasons
 
 
 class Finding(BaseModel):
+    """``kind`` separates what a diagnostic observed from what a model proposed. It is set from where the finding is
+    placed in the report, never from the wording of the statement."""
     statement: str
     evidence_ids: list[str]
+    kind: Literal["observed", "hypothesis"] | None = None
+    # Deterministic wording/evidence screen (INV-14). It can only ADD a review flag; it never promotes a hypothesis to a fact and
+    # never clears a finding. Absence of a flag is not a statement that the wording is correct.
+    review_required: bool = False
+    review_reasons: list[str] = Field(default_factory=list)
 
 
 class RootCause(BaseModel):
@@ -103,6 +129,25 @@ class InvestigationReport(BaseModel):
     stop_reason: str
     error: ReportError | None = None
     approved_tools: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _facts_and_hypotheses_stay_separate(self) -> "InvestigationReport":
+        """INV-14. Every finding is labelled by the list it sits in, and every finding must cite evidence that exists in this
+        report. A fact cannot be listed as a hypothesis or the reverse, and a statement can never certify itself."""
+        known = {e.evidence_id for e in self.evidence}
+        status_by_id = {e.evidence_id: e.status for e in self.evidence}
+        for label, findings in (("observed", self.observed_findings), ("hypothesis", self.hypotheses)):
+            for f in findings:
+                if f.kind not in (None, label):
+                    raise ValueError(f"a {f.kind} finding was placed in the {label} list")
+                if not f.evidence_ids or not set(f.evidence_ids) <= known:
+                    raise ValueError(f"a {label} finding cites evidence that is not in the report")
+                f.kind = label  # type: ignore[assignment]
+                f.review_reasons = review_reasons(label, f.statement, [status_by_id[i] for i in f.evidence_ids])
+                f.review_required = bool(f.review_reasons)
+        if self.likely_root_cause.status == "supported" and not set(self.likely_root_cause.evidence_ids) <= known:
+            raise ValueError("a supported root cause cites evidence that is not in the report")
+        return self
 
 
 class PlanCall(BaseModel):

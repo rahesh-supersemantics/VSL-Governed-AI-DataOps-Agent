@@ -150,6 +150,7 @@ class ApprovalOut(BaseModel):
     status: str
     decided_by: str | None = None
     decision_reason: str | None = None
+    effective_status: str | None = None  # presentation only: 'expired' when a pending request is past expires_at
 
 
 class GovernanceEventOut(BaseModel):

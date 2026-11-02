@@ -33,6 +33,19 @@ PROTECTED_DATABASES = frozenset({"dataops_sim", "dataops_ecommerce_demo", "maste
 INTEGRATION_DB_SUFFIX = "_test"
 
 
+NEVER_WIPE_BY_TESTS = frozenset({"dataops_demo_test"})  # the shared recovery/demo database: a `_test` suffix does not make it disposable
+
+
+def assert_wipe_confirmed(db_name: str, confirmation: str | None) -> None:
+    """The integration suite wipes and reseeds its target. It runs only when the operator has typed that database's exact name
+    into SQLSERVER_TESTS_CONFIRM_WIPE, and never against the shared demo database."""
+    name = (db_name or "").strip()
+    if name.lower() in NEVER_WIPE_BY_TESTS:
+        raise UnsafeTarget(f"Refusing: '{name}' is the shared demo database and is never wiped by the test suite.")
+    if not name or confirmation is None or confirmation.strip() != name:
+        raise UnsafeTarget("Refusing: set SQLSERVER_TESTS_CONFIRM_WIPE to the exact name of the disposable test database to allow its wipe.")
+
+
 def assert_safe_integration_target(settings: Settings, observed_database: str | None = None) -> None:
     """Fail-closed guard for the SQL Server integration suite.
 

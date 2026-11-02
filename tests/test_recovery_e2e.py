@@ -42,7 +42,7 @@ def test_e2e_1_successful_controlled_recovery(tmp_path, scenario):
     assert set(sim.active_scenario_ids()) < active_before  # the injected condition is gone (postcondition verified)
     assert env.store.get(out.request_id).status == "consumed"
     assert kinds(env) == ["recovery_proposed", "approval_requested", "approval_granted", "authorised",
-                          "recovery_attempt", "recovery_succeeded", "executed"]
+                          "recovery_attempt", "idempotency_claim_acquired", "recovery_succeeded", "executed"]
     assert_clean_ledger(env)
 
 

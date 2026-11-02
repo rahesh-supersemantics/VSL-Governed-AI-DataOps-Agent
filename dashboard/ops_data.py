@@ -20,9 +20,9 @@ from dashboard.http_core import Problem
 
 SEVERITIES = ("critical", "high", "medium", "low")
 WORKFLOW_ORDER = ("new", "investigation_pending", "investigation_running", "investigation_completed", "investigation_failed",
-                  "awaiting_approval", "recovery_running", "recovery_completed", "recovery_uncertain", "recovery_failed",
+                  "awaiting_approval", "approval_expired", "recovery_running", "recovery_completed", "recovery_uncertain", "recovery_failed",
                   "recovery_not_executed")
-RECOVERY_WORKFLOWS = frozenset(w for w in WORKFLOW_ORDER if w.startswith("recovery_") or w == "awaiting_approval")
+RECOVERY_WORKFLOWS = frozenset(w for w in WORKFLOW_ORDER if w.startswith("recovery_") or w in ("awaiting_approval", "approval_expired"))
 SORT_KEYS = {"created_at": "Created", "updated_at": "Updated", "severity": "Severity", "title": "Title",
              "workflow_status": "Workflow status", "incident_id": "Incident id"}
 PAGE_SIZES = (10, 25, 50, 100)
@@ -165,7 +165,11 @@ def recovery_summary(rec: dict[str, Any]) -> dict[str, Any]:
     verified = rec.get("verified_outcome") or "not_applicable"
     execution = rec.get("execution_status") or "not_run"
     notes: list[str] = []
-    if phase == "awaiting_approval":
+    ap = rec.get("approval") if isinstance(rec.get("approval"), dict) else {}
+    if phase == "approval_expired" or (rec.get("status") == "awaiting_approval" and ap.get("effective_status") == "expired"):
+        headline, tone = "The approval request EXPIRED before a decision. Nothing has been executed.", "warning"
+        notes.append("It can no longer be approved; a new recovery request is needed. The stored status may still read 'pending'.")
+    elif phase == "awaiting_approval":
         headline, tone = "Awaiting human approval. Nothing has been executed.", "info"
     elif phase == "recovery_running":
         headline, tone = "Resuming after an approval. The result is not recorded yet.", "info"
@@ -190,8 +194,10 @@ def recovery_summary(rec: dict[str, Any]) -> dict[str, Any]:
 
 def approval_actionable(rec: dict[str, Any]) -> bool:
     approval = rec.get("approval") if isinstance(rec.get("approval"), dict) else None
-    return bool(approval and approval.get("status") == "pending" and rec.get("status") == "awaiting_approval"
-                and rec.get("approval_request_id"))
+    # the server's effective status wins: a pending request past its expiry is not actionable (an older API without the field
+    # falls back to the stored status; the server still refuses an expired decision either way)
+    status = approval.get("effective_status") or approval.get("status") if approval else None
+    return bool(approval and status == "pending" and rec.get("status") == "awaiting_approval" and rec.get("approval_request_id"))
 
 
 def decision_outcome_text(result) -> tuple[str, str]:
@@ -449,3 +455,53 @@ def demo_row(item: dict[str, Any]) -> dict[str, Any]:
     return {"incident_id": item.get("incident_id"), "title": (item.get("title") or "")[:80], "category": item.get("category"),
             "severity": item.get("severity"), "status": item.get("status"), "pipeline": item.get("affected_pipeline"),
             "detected_at": item.get("detected_at"), "review_flag": "yes" if item.get("human_review_required") else "no"}
+
+
+def governance_panel(view: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """(label, tone, text) rows for the governance panel. Only what the backend reported: nothing is inferred here, and
+    the four distinctions (policy vs person, plan vs executed, attempted vs verified, escalated) are always shown separately."""
+    life = view.get("lifecycle") or {}
+    auth = view.get("authorisation") or {}
+    execu = view.get("execution") or {}
+    comp = view.get("compensation") or {}
+    rows: list[tuple[str, str, str]] = []
+    ana = view.get("analysis") or {}
+    if ana:
+        counts = ""
+        if ana.get("observed_findings") is not None:
+            counts = f" {ana['observed_findings']} observed finding(s) and {ana['hypotheses']} hypothesis(es), kept separate; hypotheses are not facts."
+        rows.append(("Analysis", "warning" if ana.get("mode") == "live" else "info", str(ana.get("note", "")) + counts))
+    req = view.get("request") or {}
+    if req:
+        rows.append(("Request", "info", f"Risk {req.get('risk')}; target {req.get('target')}; evidence {', '.join(req.get('evidence_refs') or []) or 'none'}; "
+                                        f"expires {req.get('expires_at')}." + (" EXPIRED: no decision was made in time, so this request can no longer be approved." if req.get("expired") else "")))
+    exact = life.get("exactness", "approximate")
+    stored = life.get("stored_status") or "unknown"
+    rows.append(("Lifecycle", "info", f"{life.get('state', 'Unknown')} ({exact} mapping of stored status '{stored}')"
+                 + (f" - {life['note']}" if life.get("note") else "")))
+    kind = auth.get("kind", "none")
+    rows.append(("Authorisation", {"policy": "warning", "human": "success"}.get(kind, "info"),
+                 {"policy": "By POLICY (no person approved). ", "human": "By a PERSON. ", "rejected_by_person": "REJECTED by a person. ",
+                  "none": "NOT authorised. "}.get(kind, "Unknown. ") + (f"Identity: {auth['by']}. " if auth.get("by") else "") + str(auth.get("note", ""))))
+    verified = bool(execu.get("verified_success"))
+    attempted = bool(execu.get("attempted"))
+    rows.append(("Execution", "success" if verified else ("error" if attempted else "info"),
+                 ("ATTEMPTED and independently VERIFIED. " if verified else "ATTEMPTED, NOT verified as success. " if attempted else "NOT attempted. ")
+                 + str(execu.get("note", ""))))
+    plan = comp.get("plan")
+    rows.append(("Compensation", "warning" if plan else "info",
+                 ("PROPOSED only, NOT executed. " if plan else "No plan. ") + str(comp.get("note", ""))
+                 + (f" Strategy: {plan['strategy']}" if plan else "")))
+    stamps = view.get("timestamps") or {}
+    rows.append(("Timestamps", "info", f"requested {stamps.get('created_at') or 'n/a'}; started {stamps.get('started_at') or 'not started'}; "
+                                       f"finished {stamps.get('completed_at') or 'not finished'}."))
+    for pn, v in sorted((view.get("prenodes") or {}).items()):
+        verdict = v.get("verdict", "not_recorded")
+        text = {"passed": "PASSED", "failed": "FAILED", "unknown": "UNKNOWN (outcome not established)",
+                "not_recorded": "NOT RECORDED (this is not a pass)"}.get(verdict, "NOT RECORDED (this is not a pass)")
+        basis = {"recorded": "recorded in the ledger", "implied_by_later_step": "implied by a later recorded step"}.get(v.get("basis"), "")
+        rows.append((pn, {"passed": "success", "failed": "error", "unknown": "warning"}.get(verdict, "info"),
+                     text + (f" - {basis}" if basis and verdict != "not_recorded" else "") + (f". {v['note']}" if v.get("note") else "")))
+    rows.append(("Escalation", "error" if view.get("escalated") else "info",
+                 "Escalated to a person; automation stopped, no retry." if view.get("escalated") else "Not escalated."))
+    return rows

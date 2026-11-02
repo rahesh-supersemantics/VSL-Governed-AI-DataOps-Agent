@@ -1,112 +1,85 @@
-# Architecture (planned)
+# Architecture
 
-> **Status:** this describes the *intended* architecture. As of Phase 1 only the
-> FastAPI skeleton (`/health`, `/ready`) and configuration existed; later phases added the simulation, diagnostics,
-> MCP server, investigation agent and (Phase 6) VSL governance of a no-op protected action
-> ([vsl-governance.md](vsl-governance.md)). Real recovery, approvals and persistence are **not implemented yet**.
+Describes the repository as implemented. Governance specifics are in [governance-and-safety.md](governance-and-safety.md); the
+route list is in [api-reference.md](api-reference.md). (An earlier version of this file described a planned design; it has been
+replaced.)
 
 ## Purpose
 
-An AI DataOps Agent that investigates data pipeline failures using evidence from
-real tools, distinguishes confirmed observations from hypotheses, recommends a
-corrective action, and performs only governed, human-authorised recovery. If the
-evidence is insufficient it reports the root cause as unconfirmed; it never
-invents results or claims recovery without independent verification.
+Investigate data-pipeline incidents using evidence from read-only tools, separate confirmed observations from hypotheses,
+propose a corrective action, and run only governed, human-authorised recovery on a **simulated** environment. When evidence is
+insufficient the root cause is reported as unconfirmed.
 
-## Planned flow
+## Components
 
-```
-Incident
-   │
-   ▼
-FastAPI backend ── validation, authentication, access control, incident lifecycle
-   │
-   ▼
-LangGraph orchestration ── stateful plan → collect evidence → analyse → report
-   │        ▲                (pauses for human approval; durable checkpoints)
-   │        └── OpenAI API ── incident understanding, planning, interpretation, reporting
-   ▼
-MCP tool integration ── custom DataOps MCP server exposing validated, read-only diagnostics
-   │
-   ▼
-VSL governance ── VSL-Core evaluates protected actions BEFORE they execute
-   │               (via the VSL-LangGraph adapter, subject to compatibility checks)
-   ▼
-Controlled execution ── restricted, authenticated, duplicate-protected recovery executor
-   │
-   ▼
-Verification and audit evidence ── independent outcome check; investigation,
-                                    governance, approval and result records
-```
-
-## Component roles
-
-| Component | Role | Not its role |
+| Component | Code | Role |
 |---|---|---|
-| OpenAI API | Model inference for understanding, planning, interpreting evidence, drafting reports | Security boundary or source of truth for tool results |
-| LangGraph | Stateful workflow, tool coordination, human-approval interruptions | Authorisation |
-| MCP server | Standard channel to a fixed set of validated diagnostic tools | Authorisation or governance |
-| VSL-Core / adapter | Pre-execution governance of protected actions | Replacing app-level validation or OS/database permissions |
-| Executor | Performs approved, revalidated actions against configured test resources | Acting on model output directly |
+| FastAPI root app | `app/main.py` | `/health`, `/ready`, `/sim/*`; mounts `/api/v1` |
+| Versioned API | `app/api/v1/` (`routes/`, `security.py`, `permissions.py`, `errors.py`) | Bearer-token auth, roles, uniform errors, throttling of failed auth |
+| Services | `app/services/` (`container.py`, `investigations.py`, `recoveries.py`, `status.py`) | Wiring, workflow logic, derived workflow status |
+| Investigation agent | `app/agent/` | LangGraph state machine: receive incident, plan, execute tools, evaluate, generate report. Offline heuristic by default; optional OpenAI client |
+| MCP server | `app/mcp_server/`, `app/diagnostics/readonly.py` | 11 read-only diagnostic tools over stdio; `ReadOnlyRepo.READ_METHODS` allow-list (application-level, not a read-only DB login) |
+| Simulator | `app/simulation/`, `scripts/db_*.py`, `scripts/scenario.py` | SQL Server `dataops_sim` pipelines, runs, scenarios, simulator incidents |
+| Synthetic demo set | `app/demo/` | 100 in-process `DEMO-nnnn` records; browse-only |
+| Governance | `app/governance/` | VSL policy, gate compilation, governed workflow, ledger, ledger view, audit CLI |
+| Approvals and recovery | `app/recovery/` | actions, approvals (binding, HMAC, single use, expiry), auth, runner, workflow, evidence/idempotency, expiry, governance view, PreNode verdicts, lifecycle, catalogue |
+| Persistence | `app/persistence/` | SQLite schema and repositories for the operations store |
+| Ticketing | `app/integrations/github_issues.py` | Optional GitHub Issues |
+| Dashboards | `dashboard/ops_app.py`, `dashboard/ledger_app.py` | Streamlit Operations Dashboard (:8501) and read-only VerbaLedger Explorer (:8502) |
+| Launcher | `scripts/dev_stack.py` | Starts API and both dashboards with consistent development tokens |
 
-The governance boundary must cover **every** route to a protected action, whether
-reached through MCP or directly by the backend. Application validation, access
-controls, resource restrictions and database/OS permissions each enforce security
-independently.
+## Data flow
 
-## Environment and scope
+```mermaid
+sequenceDiagram
+  participant U as Dashboard / API client
+  participant API as /api/v1
+  participant AG as Agent (LangGraph)
+  participant MCP as MCP read-only tools
+  participant AP as ApprovalService
+  participant GOV as Governed workflow (VSL)
+  participant RR as RecoveryRunner
+  participant L as Ledger
+  U->>API: import/create incident
+  U->>API: start investigation (202)
+  API->>AG: investigate (background)
+  AG->>MCP: read-only tool calls (evidence ids)
+  AG-->>API: report (facts cite evidence)
+  U->>API: request recovery (proposal)
+  API->>GOV: PN-03 action valid, PN-02 evidence policy
+  GOV->>AP: approval request + evidence digest
+  AP->>L: approval_requested (digest)
+  U->>API: approve / reject (person)
+  API->>AP: decision (permission, binding, expiry)
+  U->>API: resume
+  API->>GOV: VSL gates + ledger verify
+  GOV->>RR: PN-04..PN-08 target, preconditions, claim, consume, execute, verify
+  RR->>L: outcome records
+  U->>API: GET .../governance (view from stored rows + ledger)
+```
 
-- The project runs against a **simulated operational environment** (synthetic
-  SQL Server data, local services, a test pipeline, structured logs, a restricted
-  recovery endpoint). There is no company environment.
-- It is **general-purpose** and not customised for any particular company.
-- It does **not require a DataMart**; SQL Server holds synthetic operational and
-  pipeline-related tables only.
+Recovery order (enforced in `app/recovery/runner.py`): attempt record, suspension/ledger check, precondition (target and
+`DB_NAME()`), idempotency claim, single-use consume, execute, independent verification, result record.
 
-## Phase 5 implementation (investigation agent)
+## Stores
 
-`app/agent/` is a LangGraph workflow (receive incident, plan, execute tools, evaluate, bounded loop, report) that
-reaches diagnostics only through the Phase 4 MCP server over stdio. OpenAI (strict JSON-schema output, no function
-calling) proposes tool calls and interpretation; code validates arguments against the discovered schemas, enforces
-budgets, takes facts from tool results, verifies every model claim against the evidence, computes the status and
-caps confidence. A deterministic offline engine stands in for the model for demos and tests. It cannot import the
-database, diagnostics or simulation code and has no write or recovery capability. Governance (Phase 6) and
-human-approved recovery (Phase 7, `app/recovery/`) are not part of it. See [agent.md](agent.md).
+| Store | Holds | Writer |
+|---|---|---|
+| SQL Server `dataops_sim` | Simulated pipelines, runs, validation results, simulator incidents | Setup scripts and simulator; recovery only on allow-listed `*_test` databases |
+| `data/operations.sqlite3` | Workflow incidents, investigations, recoveries, tickets | API |
+| `data/approvals.sqlite3` | Approval requests, decisions, evidence metadata, execution claims | Approval service |
+| `data/governance_ledger.jsonl` | Hash-chained governance events | Governance layer (Explorer is read-only) |
 
-## Phase 4 implementation (MCP server)
+There is no automatic synchronisation from SQL Server to the workflow store; a simulator incident enters the workflow only through
+the explicit, idempotent import route.
 
-`app/mcp_server/` is a thin, read-only MCP adapter over `DiagnosticsService`: eight tools with typed, bounded
-inputs and structured outputs, served over stdio with the official Python MCP SDK. It contains no diagnostic
-logic, SQL, write or recovery capability, and makes no OpenAI call. Its client is the Phase 5 agent; VSL governance
-remains a later phase. See [mcp-server.md](mcp-server.md).
+## Design decisions and boundaries
 
-## Phase 3 implementation (diagnostic tools)
+* The model reads and reports; it never receives write tools and its output is never executed directly.
+* Authorisation is separate from execution; approval executes nothing.
+* VSL constructs are used where they fit (2 invariants, 1 PreNode); other controls are ordinary, tested Python and are labelled so.
+* Single host by design (SQLite, JSONL ledger, one Uvicorn worker). No multi-replica support.
+* Not implemented: real data-platform connectors, a production identity provider, TLS, executable compensation.
 
-`app/diagnostics/` holds read-only tools (pipeline status, log inspection, duplicates, data quality,
-freshness, record-count reconciliation, schema contract) that return a common structured
-`DiagnosticResult`. They reuse the Phase 2 validators, clock, log store and repository interface through a
-`ReadOnlyRepo`, and are exposed by `scripts/diagnose.py` and (Phase 4) the MCP server. The LangGraph agent,
-VSL governance and any recovery action remain later phases. See [diagnostics.md](diagnostics.md).
-
-## Phase 2 implementation (simulated operational environment)
-
-Implemented in Phase 2 (details in [simulation.md](simulation.md)): a SQL Server schema of ordinary
-operational tables, deterministic synthetic data, three simulated pipelines, JSON Lines operational logs,
-six controlled failure scenarios, a guarded reset, and read-only `/sim/*` endpoints. This is the *evidence
-source* the later agent will investigate. Still **not** implemented: diagnostic tools, MCP, LangGraph,
-OpenAI use, VSL governance, recovery. The simulation depends on a storage interface (`SimRepository`), keeping
-pipeline logic, database access and API routes separate.
-
-## Phase 1 implementation (what exists today)
-
-- `app/config.py` – Pydantic Settings; secrets held as `SecretStr`, never logged.
-- `app/main.py` – FastAPI app with `GET /health` (liveness, no config access) and
-  `GET /ready` (config validity and required values, no secret values returned),
-  request logging (method, path, status only) and a generic 500 handler.
-- `app/core/logging.py` – log redaction for API keys, bearer tokens and similar.
-- `app/api/v1/`, `app/services/`, `app/persistence/`, `app/integrations/` – Phase 8 API, services, SQLite operational store and GitHub Issues
-  adapter, mounted at `/api/v1`. Recovery is reachable only through the Phase 7 approval workflow. See [phase8-api-persistence-ticketing.md](phase8-api-persistence-ticketing.md).
-- `app/core/startup.py`, `Dockerfile`, `docker-compose.yml`, `.github/workflows/ci.yml` – Phase 9 production start-up validation, single-host
-  container image and CI. See [phase9-end-to-end-validation-cloud-infrastructure.md](phase9-end-to-end-validation-cloud-infrastructure.md).
-- `dashboard/` – Phase 10 Streamlit apps (Operations Dashboard, separate read-only VerbaLedger Explorer) that use only the HTTP API; `app/governance/ledger_view.py` and
-  `app/api/v1/routes/ledger.py` – the read-only ledger API; `app/diagnostics/tools/operations.py` – three added read-only MCP tools. See [phase10-operations-dashboard-verbaledger-mcp.md](phase10-operations-dashboard-verbaledger-mcp.md).
+See also the earlier per-phase notes: [agent.md](agent.md), [diagnostics.md](diagnostics.md), [mcp-server.md](mcp-server.md),
+[simulation.md](simulation.md), [vsl-governance.md](vsl-governance.md).

@@ -75,6 +75,18 @@ async def get_recovery(recovery_id: str = Path(min_length=1, max_length=64), _: 
     return recovery_out(services, row)
 
 
+@router.get("/recoveries/{recovery_id}/governance")
+async def get_recovery_governance(recovery_id: str = Path(min_length=1, max_length=64), _: Caller = Depends(require("recovery:read")),
+                                  services: Services = Depends(get_services)) -> dict:
+    """Read-only governance view: lifecycle state, who authorised (policy vs person), compensation PLAN (never executed),
+    attempted vs verified execution, escalation and ledger outcomes."""
+    row = services.store.get_recovery(recovery_id)
+    if row is None:
+        raise ApiError(404, "recovery_not_found", "No such recovery.")
+    recoveries = _recoveries(services)
+    return recoveries.governance_view(recoveries.reconcile(row))
+
+
 @router.post("/recoveries/{recovery_id}/resume", response_model=RecoveryOut)
 async def resume_recovery(recovery_id: str = Path(min_length=1, max_length=64), _: Caller = Depends(require("recovery:resume")),
                           services: Services = Depends(get_services)) -> RecoveryOut:

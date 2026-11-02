@@ -1,12 +1,13 @@
 """Derived workflow status. Computed at read time from the stored rows; never persisted, so it cannot contradict them.
 
-new -> investigation_pending/running/completed/failed -> awaiting_approval -> recovery_running ->
+new -> investigation_pending/running/completed/failed -> awaiting_approval (or approval_expired when the pending request is
+past its expiry; presentation only) -> recovery_running ->
 recovery_completed | recovery_uncertain | recovery_failed | recovery_not_executed
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from app.persistence import OperationsStore
 
@@ -14,10 +15,11 @@ _NOT_EXECUTED = {"rejected", "expired", "cancelled", "approval_invalid", "approv
                  "denied_human_review", "refused_suspended", "terminal_suspended", "blocked"}
 
 
-def recovery_phase(recovery: dict[str, Any]) -> str:
+def recovery_phase(recovery: dict[str, Any], *, approval_expired: bool = False) -> str:
+    """``approval_expired`` is a presentation fact computed by the caller (app.recovery.expiry); nothing is stored."""
     status = recovery["status"]
     if status == "awaiting_approval":
-        return "awaiting_approval"
+        return "approval_expired" if approval_expired else "awaiting_approval"
     if status == "resuming":
         return "recovery_running"
     if status == "executed":
@@ -29,14 +31,15 @@ def recovery_phase(recovery: dict[str, Any]) -> str:
     return "recovery_failed"
 
 
-def workflow_status(store: OperationsStore, incident: dict[str, Any]) -> str:
+def workflow_status(store: OperationsStore, incident: dict[str, Any], *, approval_expired: Callable[[dict[str, Any]], bool] | None = None) -> str:
     investigations = store.list_investigations(incident["incident_id"])
     recoveries = store.list_recoveries(incident["incident_id"])
     latest_inv = investigations[0] if investigations else None
     latest_rec = recoveries[0] if recoveries else None
     if latest_rec is not None and (latest_inv is None or latest_rec["created_at"] >= latest_inv["created_at"]
                                    or latest_rec["status"] in ("awaiting_approval", "resuming")):
-        return recovery_phase(latest_rec)
+        expired = bool(approval_expired and latest_rec["status"] == "awaiting_approval" and approval_expired(latest_rec))
+        return recovery_phase(latest_rec, approval_expired=expired)
     if latest_inv is None:
         return "new"
     return {"pending": "investigation_pending", "running": "investigation_running", "completed": "investigation_completed",

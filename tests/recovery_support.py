@@ -15,7 +15,7 @@ from typing import Any
 
 from app.agent import OfflineHeuristicModel
 from app.governance import GovernanceRecorder, GovernedActionService, open_ledger
-from app.governance.policy import build_policy
+from app.governance.policy import EvidenceMeta, build_policy
 from app.recovery import (
     RECOVERY_ACTIONS,
     ApprovalService,
@@ -48,7 +48,7 @@ def make_auth(revoked: set[str] = frozenset()) -> StaticTokenAuthenticator:
 
 class Clock:
     def __init__(self) -> None:
-        self.now = datetime(2026, 10, 19, 1, 0, 0, tzinfo=timezone.utc)
+        self.now = datetime.now(timezone.utc).replace(microsecond=0)  # real 'now': investigations stamp evidence with the real clock
 
     def __call__(self) -> datetime:
         return self.now
@@ -111,10 +111,19 @@ def make_env(tmp_path: Path, *, name: str = "a", clock: Clock | None = None, sim
                clock, ledger_path, db_path)
 
 
+def fresh_evidence(ids: tuple[str, ...], *, investigation: str = "INV-TEST-1", tool: str = "check_data_freshness",
+                   status: str = "issue_detected", collected_at: str | None = None) -> tuple[EvidenceMeta, ...]:
+    """Evidence metadata that satisfies evidence-policy-v1 at the test Clock's start time."""
+    when = collected_at if collected_at is not None else Clock().now.isoformat()
+    return tuple(EvidenceMeta(i, tool, status, when, investigation) for i in ids)
+
+
 def prop(action: str = RERUN[0], params: dict[str, Any] | None = None, *, status: str = "issue_identified",
          refs: tuple[str, ...] = ("E1",), known: tuple[str, ...] = ("E1", "E2"), incident: str = "INV-TEST-1",
-         reason: str = "test") -> ProposedRecovery:
-    return ProposedRecovery(incident, action, dict(RERUN[1] if params is None else params), refs, reason, status, known)
+         reason: str = "test", evidence: tuple[EvidenceMeta, ...] | None = None, investigation: str = "INV-TEST-1") -> ProposedRecovery:
+    meta = fresh_evidence(tuple(dict.fromkeys((*known, *refs))), investigation=investigation) if evidence is None else evidence
+    return ProposedRecovery(incident, action, dict(RERUN[1] if params is None else params), refs, reason, status, known,
+                            evidence=meta, investigation_id=investigation)
 
 
 def run(coro):

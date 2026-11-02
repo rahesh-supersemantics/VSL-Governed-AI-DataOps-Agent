@@ -675,6 +675,14 @@ elif page == "Recovery & approvals":
                     st.write(f"**Reason:** {ap['reason']}")
                     if ap.get("decided_by"):
                         st.write(f"**Decided by:** {ap['decided_by']} - {ap.get('decision_reason') or ''}")
+                gov = client.governance(rec_id)  # backend state + ledger outcomes; read-only, fresh every time
+                st.subheader("Governance")
+                if not gov.ok:
+                    show_problem(gov.problem, "the governance view")
+                else:
+                    for label, kind_, text_ in d.governance_panel(gov.data):
+                        tone(kind_, f"**{label}.** {text_}")
+                    st.caption("Ledger outcomes: " + (", ".join(gov.data.get("ledger_outcomes") or []) or "none"))
                 if rec.get("governance_events"):
                     with st.expander("Governance trail (event names; use the VerbaLedger Explorer for the full trace)"):
                         st.dataframe(pd.DataFrame(rec["governance_events"]), hide_index=True, width="stretch")

@@ -19,7 +19,7 @@ from app.db.connection import (
     make_engine,
 )
 from app.db.repository import SqlRepository
-from app.db.safety import assert_safe_integration_target, assert_safe_reset_target
+from app.db.safety import assert_safe_integration_target, assert_safe_reset_target, assert_wipe_confirmed
 from app.db.schema import metadata
 from app.simulation.runlog import RunLogStore
 from app.simulation.service import SimulationService
@@ -38,6 +38,7 @@ def sql_settings():
     if os.environ.get("RUN_SQLSERVER_TESTS") != "1":
         pytest.skip("Set RUN_SQLSERVER_TESTS=1 (and DB_SERVER) to run SQL Server integration tests.")
     assert TEST_DB.lower().endswith("_test"), "TEST_DB_NAME must end with _test"
+    assert_wipe_confirmed(TEST_DB, os.environ.get("SQLSERVER_TESTS_CONFIRM_WIPE"))  # typed confirmation; refuses the shared demo DB
     settings = Settings(db_name=TEST_DB, db_auth_mode="windows",
                         db_server=os.environ.get("DB_SERVER", r"localhost"),
                         db_trust_server_certificate=os.environ.get("DB_TRUST_SERVER_CERTIFICATE", "true").lower() == "true")

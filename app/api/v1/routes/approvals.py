@@ -7,7 +7,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Path
 
 from app.api.v1.errors import ApiError
-from app.api.v1.mappers import approval_out, recovery_out
+from app.api.v1.mappers import approval_out, recovery_out, services_now
 from app.api.v1.schemas import ApprovalOut, DecisionIn, DecisionOut
 from app.api.v1.security import Caller, get_services, require
 from app.recovery import ApprovalDenied
@@ -30,7 +30,7 @@ async def get_approval(request_id: str = RequestId, _: Caller = Depends(require(
     record = _approvals(services).store.get(request_id)
     if record is None:
         raise ApiError(404, "approval_not_found", "No such approval request.")
-    return approval_out(record.summary())
+    return approval_out(record.summary(), services_now(services))
 
 
 @router.post("/approvals/{request_id}/decision", response_model=DecisionOut)
@@ -47,4 +47,4 @@ async def decide(body: DecisionIn, request_id: str = RequestId, caller: Caller =
             summary, recovery = record.summary(), None
     except ApprovalDenied as exc:
         raise ApiError(denial_status(exc.code), "approval_denied", "The approval decision was refused.", details={"reason": exc.code})
-    return DecisionOut(approval=approval_out(summary), recovery=recovery_out(services, recovery) if recovery else None)
+    return DecisionOut(approval=approval_out(summary, services_now(services)), recovery=recovery_out(services, recovery) if recovery else None)

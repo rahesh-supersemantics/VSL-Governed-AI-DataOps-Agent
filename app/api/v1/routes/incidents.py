@@ -6,7 +6,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, Path, Query, Re
 
 from app.agent import InvalidIncident
 from app.api.v1.errors import ApiError
-from app.api.v1.mappers import incident_out, investigation_detail_out, investigation_out
+from app.api.v1.mappers import approval_expired_checker, incident_out, investigation_detail_out, investigation_out
 from app.api.v1.schemas import (
     IncidentCreate,
     IncidentOut,
@@ -77,7 +77,7 @@ async def get_status(incident_id: str = IncidentId, _: Caller = Depends(require(
                      services: Services = Depends(get_services)) -> WorkflowStatusOut:
     row = incident_or_404(services, incident_id)
     invs, recs = services.store.list_investigations(incident_id), services.store.list_recoveries(incident_id)
-    return WorkflowStatusOut(incident_id=incident_id, workflow_status=workflow_status(services.store, row), incident_status=row["status"],
+    return WorkflowStatusOut(incident_id=incident_id, workflow_status=workflow_status(services.store, row, approval_expired=approval_expired_checker(services)), incident_status=row["status"],
                              latest_investigation_id=invs[0]["investigation_id"] if invs else None,
                              latest_recovery_id=recs[0]["recovery_id"] if recs else None)
 

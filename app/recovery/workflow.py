@@ -29,10 +29,12 @@ from vsl_core.exceptions import AutomationDeniedException
 
 from app.agent.models import InvestigationReport
 from app.governance.ledger import GovernanceLedgerError, GovernanceRecorder, new_decision_id
-from app.governance.policy import ApprovalContext, GateInput, failed_preconditions
+from app.diagnostics import TOOL_NAMES
+from app.diagnostics.service import OPERATIONS_TOOL_NAMES
+from app.governance.policy import ApprovalContext, EvidenceMeta, EvidencePolicy, GateInput, failed_preconditions
 from app.governance.workflow import GovernanceResult, GovernedActionService
 from app.recovery.actions import ActionRejected, ValidatedAction, validate_action
-from app.recovery.approvals import ApprovalDenied, ApprovalService, binding_digest
+from app.recovery.approvals import ApprovalDenied, ApprovalService, binding_digest, evidence_digest
 from app.recovery.risk_policy import RiskPolicy
 from app.recovery.runner import RecoveryContext
 from app.simulation.scenarios import BY_ID, FAILURE_CODE_TO_SCENARIO
@@ -48,6 +50,13 @@ class ProposedRecovery:
     reason: str
     report_status: str
     known_evidence_ids: tuple[str, ...]
+    # Explicit evidence metadata (provenance and time) for evidence-policy-v1. Empty means "none supplied", which is rejected.
+    evidence: tuple[EvidenceMeta, ...] = ()
+    investigation_id: str = ""
+
+
+def default_evidence_policy() -> EvidencePolicy:
+    return EvidencePolicy(known_tools=frozenset(TOOL_NAMES) | frozenset(OPERATIONS_TOOL_NAMES))
 
 
 def proposal_from_report(report: InvestigationReport, action_type: str, parameters: dict[str, Any], *,
@@ -56,7 +65,9 @@ def proposal_from_report(report: InvestigationReport, action_type: str, paramete
     return ProposedRecovery(
         incident_id=incident_id or report.investigation_id, action_type=action_type, parameters=dict(parameters),
         evidence_refs=cited, reason=reason or (report.likely_root_cause.statement or "")[:500],
-        report_status=report.status, known_evidence_ids=tuple(e.evidence_id for e in report.evidence))
+        report_status=report.status, known_evidence_ids=tuple(e.evidence_id for e in report.evidence),
+        evidence=tuple(EvidenceMeta(e.evidence_id, e.tool, e.status, e.collected_at or "", report.investigation_id) for e in report.evidence),
+        investigation_id=report.investigation_id)
 
 
 def suggest_recovery(report: InvestigationReport) -> tuple[str, dict[str, Any]] | None:
@@ -107,8 +118,9 @@ _UNUSABLE = {"rejected": "rejected", "expired": "expired", "cancelled": "cancell
 
 class RecoveryWorkflow:
     def __init__(self, approvals: ApprovalService, governed: GovernedActionService, recorder: GovernanceRecorder,
-                 *, checkpointer: Any = None, risk_policy: RiskPolicy | None = None) -> None:
+                 *, checkpointer: Any = None, risk_policy: RiskPolicy | None = None, evidence_policy: EvidencePolicy | None = None) -> None:
         self.approvals, self.governed, self.recorder = approvals, governed, recorder
+        self.evidence_policy = evidence_policy or default_evidence_policy()  # always on: recovery never runs on unchecked evidence
         self.risk_policy = risk_policy  # None = every action waits for a person
         self._checkpointer = checkpointer or InMemorySaver()
         self._threads: dict[str, str] = {}  # request_id -> thread id (in-process only; lost on restart)
@@ -149,7 +161,9 @@ class RecoveryWorkflow:
                                     outcome="recovery_refused_suspended", action=validated.action_type)
                 return {"outcome": "refused_suspended", "reasons": ["automation_suspended"], "entry_ids": [entry.entry_id]}
             early = GateInput(action=validated.action_type, report_status=p.report_status,
-                              cited_evidence_ids=p.evidence_refs, known_evidence_ids=p.known_evidence_ids)
+                              cited_evidence_ids=p.evidence_refs, known_evidence_ids=p.known_evidence_ids,
+                              evidence=p.evidence, evidence_policy=self.evidence_policy, investigation_id=p.investigation_id or None,
+                              evaluated_at=approvals.clock())
             failed = [f for f in failed_preconditions(early) if f != "approval_missing_or_mismatched"]
             if failed:  # a normal PreNode denial recorded by the Phase 6 gates (SUFFICIENT: governance worked)
                 res = await governed.govern(early, decision_id=state["decision_id"], caused_by=state.get("cause_entry_id"))
@@ -159,7 +173,8 @@ class RecoveryWorkflow:
                 record = approvals.create_request(
                     incident_id=p.incident_id, action=validated, evidence_refs=p.evidence_refs, reason=p.reason,
                     governance_state="active", report_status=p.report_status,
-                    caused_by=state.get("cause_entry_id"), decision_id=state["decision_id"])
+                    caused_by=state.get("cause_entry_id"), decision_id=state["decision_id"],
+                    evidence_meta=p.evidence, investigation_id=p.investigation_id)
             except ApprovalDenied as exc:
                 entry = note(state, "recovery_action_rejected", reason=exc.code)
                 return {"outcome": "action_rejected", "reasons": [exc.code], "entry_ids": [entry.entry_id]}
@@ -204,9 +219,22 @@ class RecoveryWorkflow:
             record = approvals.store.get(state["request_id"])
             if record is None:
                 return {"outcome": "approval_invalid", "reasons": ["missing"], "execution_status": "not_run"}
+            stored = approvals.store.get_evidence(record.request_id)  # re-checked NOW: evidence ages while a request waits
+            inv_id, meta = stored if stored else ("", ())
+            recorded = rec.get_entry(record.ledger_request_entry)  # the digest written when the request was made
+            if recorded is None or recorded.payload.get("evidence_digest") != evidence_digest(meta):
+                try:
+                    rec.monitor(decision_id=state["decision_id"], drift=False, caused_by=record.ledger_request_entry,
+                                outcome="evidence_integrity_failed", request_id=record.request_id)
+                except AutomationDeniedException:
+                    raise
+                except Exception:  # noqa: BLE001 - the denial stands whether or not the audit entry could be written
+                    pass
+                return {"outcome": "approval_invalid", "reasons": ["evidence_integrity_failed"], "execution_status": "not_run"}
             candidate = GateInput(
                 action=record.action_type, report_status=record.report_status,
-                cited_evidence_ids=record.evidence_refs, known_evidence_ids=record.evidence_refs,
+                cited_evidence_ids=record.evidence_refs, known_evidence_ids=tuple(m.evidence_id for m in meta),
+                evidence=meta, evidence_policy=self.evidence_policy, investigation_id=inv_id or None, evaluated_at=approvals.clock(),
                 approval=ApprovalContext(approved_by=record.decided_by or "", approved_action=record.action_type,
                                          reference=record.request_id),
                 context=RecoveryContext(record.request_id, record.binding_digest, state["decision_id"]))

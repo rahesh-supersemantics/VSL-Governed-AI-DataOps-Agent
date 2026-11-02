@@ -55,6 +55,10 @@ class OpsClient:
     def recovery(self, recovery_id: str) -> Result:
         return self._core.get(f"/recoveries/{seg(recovery_id)}")
 
+    def governance(self, recovery_id: str) -> Result:
+        """Read-only governance view of one recovery (needs ``recovery:read``)."""
+        return self._core.get(f"/recoveries/{seg(recovery_id)}/governance")
+
     def approval(self, request_id: str) -> Result:
         return self._core.get(f"/approvals/{seg(request_id)}")
 

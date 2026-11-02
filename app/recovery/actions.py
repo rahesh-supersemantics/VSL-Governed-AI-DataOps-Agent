@@ -44,7 +44,12 @@ class ActionRejected(Exception):
 
 
 class PreconditionFailed(Exception):
-    """Raised BEFORE any side effect: the action cannot meaningfully run. Nothing was changed."""
+    """Raised BEFORE any side effect: the action cannot meaningfully run. Nothing was changed.
+    ``check`` names the stage that refused: "target" (PN-04) or "precondition" (PN-06)."""
+
+    def __init__(self, message: str = "", check: str = "precondition") -> None:
+        super().__init__(message)
+        self.check = check
 
 
 @dataclass(frozen=True)
@@ -187,9 +192,9 @@ def assert_live_target(service: SimulationService) -> None:
     except AutomationDeniedException:
         raise
     except Exception:  # noqa: BLE001 - cannot verify, so do not act
-        raise PreconditionFailed("the connected database could not be verified") from None
+        raise PreconditionFailed("the connected database could not be verified", "target") from None
     if not actual or actual != expected:
-        raise PreconditionFailed("the connected database does not match the validated recovery target")
+        raise PreconditionFailed("the connected database does not match the validated recovery target", "target")
 
 
 @dataclass
@@ -213,7 +218,7 @@ class RecoveryExecutor:
         try:
             assert_recovery_target(svc, self.allowed_targets)  # revalidated at execution time, not only at start-up
         except UnsafeRecoveryTarget:
-            raise PreconditionFailed("the recovery target is no longer permitted") from None
+            raise PreconditionFailed("the recovery target is no longer permitted", "target") from None
         assert_live_target(svc)
         if svc.repo.get_state() is None:
             raise PreconditionFailed("the simulation is not seeded")

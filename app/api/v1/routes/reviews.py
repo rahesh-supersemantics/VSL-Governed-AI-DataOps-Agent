@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, Path, Query, Response
 
 from app.api.v1.errors import ApiError
 from app.api.v1.security import Caller, get_services, require
+from app.recovery.expiry import is_expired, parse_expiry
 from app.services.container import Services, recovery_unavailable_info
 from app.services.status import recovery_phase
 
@@ -28,12 +29,7 @@ def _now(services: Services | None = None) -> datetime:
     return clock() if callable(clock) else datetime.now(timezone.utc)
 
 
-def _parse(value: str) -> datetime | None:
-    try:
-        d = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (ValueError, AttributeError):
-        return None
-    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+_parse = parse_expiry  # one shared expiry contract (app.recovery.expiry)
 
 
 def review_state(recovery: dict[str, Any], approval: dict[str, Any] | None, now: datetime | None = None) -> str:
@@ -41,8 +37,7 @@ def review_state(recovery: dict[str, Any], approval: dict[str, Any] | None, now:
         return "other"
     status = approval["status"]
     if status == "pending":
-        exp = _parse(approval["expires_at"])
-        return "expired" if exp is not None and exp <= (now or _now()) else "pending"
+        return "expired" if is_expired(approval, now or _now()) else "pending"
     if status in ("approved", "consumed"):
         return "approved"
     if status == "rejected":

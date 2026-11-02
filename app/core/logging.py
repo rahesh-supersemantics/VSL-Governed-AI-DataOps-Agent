@@ -13,7 +13,7 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # key=value or key: value for common secret names
     (
         re.compile(
-            r"(?i)\b(api[_-]?key|authorization|token|secret|password)"
+            r"(?i)\b(api[_-]?key|authorization|token|secret|password|pwd|uid)"
             r"(\s*[=:]\s*|\s+)([^\s,;&\"']+)"
         ),
         rf"\1\2{_REDACTED}",

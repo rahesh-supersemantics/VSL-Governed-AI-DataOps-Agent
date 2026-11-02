@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import ast
 import json
-import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -515,21 +514,28 @@ def test_t18_the_set_of_state_changing_http_routes_is_pinned_and_none_executes_r
 
 # ============================================================================================ T-19 / T-20
 def test_t19_offline_investigation_makes_no_external_connection_and_does_not_use_a_model_client(tmp_path, monkeypatch):
+    import app.agent.llm as llm_module
     from app.agent import OfflineHeuristicModel
-    from app.agent.models import InvestigationReport  # noqa: F401
-    attempts = []
+    from tests import offline_network_guard
 
-    def deny(self, *a, **k):
-        attempts.append(a)
-        raise OSError("network blocked by the test")
+    # Not a blanket refusal of socket.connect: asyncio.run() builds an event loop whose self-pipe is made by
+    # socket.socketpair(), and on Windows (Python 3.10) that pair is emulated with a loopback connect() to itself. A guard
+    # that refuses every connect therefore fails at event-loop creation, before the investigation runs. This guard refuses
+    # every connect (and connect_ex) EXCEPT a loopback connect made from inside socketpair, so any real outbound or other
+    # loopback connection still raises AssertionError (see tests/offline_network_guard.py and
+    # test_governance_offline_mode.py::test_the_guard_really_refuses_an_outbound_connection).
+    offline_network_guard.install(monkeypatch)
 
-    monkeypatch.setattr(socket.socket, "connect", deny)
+    def live_client_built(*a, **k):
+        raise AssertionError("the live OpenAI client was constructed in offline mode")
+    monkeypatch.setattr(llm_module.OpenAIChatModel, "__init__", live_client_built)
+
     sim = SimulationService(InMemoryRepo(), RunLogStore(tmp_path / "logs"))
     sim.seed()
     apply_scenario(sim, "duplicate-records")
     model = OfflineHeuristicModel()
     report = run_agent(server_for(sim), "orders look wrong", model)
-    assert report.status == "issue_identified" and attempts == []
+    assert report.status == "issue_identified" and report.mode == "offline"
     assert getattr(model, "mode", "offline") != "live"
     from app.services.container import _llm_factory
     from app.agent.config import AgentConfig
@@ -575,3 +581,30 @@ def test_t21_human_approval_does_not_imply_that_anything_executed(tmp_path):
     assert "remove_injected_condition" not in [e.payload.get("action") for e in env.recorder.ledger.store.all_entries()
                                                if e.payload.get("outcome") in ("recovery_attempt", "recovery_succeeded")]
     assert run(env.workflow.resume(out.request_id)).executed                    # execution is a separate, governed step
+
+
+def test_t17_a_restart_after_the_approval_was_spent_is_reported_uncertain_and_escalated(tmp_path):
+    """reconcile(): a row stuck in 'resuming' whose approval is consumed is OutcomeUnknown + an escalation entry, never success."""
+    from app.persistence import OperationsStore  # noqa: F401  (documents the store the service reconciles)
+    from app.services.recoveries import RecoveryService
+    env, out = paused(tmp_path)
+    approve(env, out.request_id)
+    env.approvals.consume(out.request_id, "dec-restart", env.store.get(out.request_id).binding_digest)  # spent, then 'crash'
+    recorded = []
+
+    class Store:
+        def record_recovery_outcome(self, rid, **kw):
+            recorded.append(kw)
+            return None
+
+        def get_recovery(self, rid):
+            return {"recovery_id": rid}
+
+    svc = RecoveryService.__new__(RecoveryService)
+    svc.approvals, svc.recorder, svc.store, svc._inflight = env.approvals, env.recorder, Store(), set()
+    row = {"recovery_id": "R1", "status": "resuming", "approval_request_id": out.request_id, "decision_id": "dec-restart",
+           "ledger_entry_ids": []}
+    svc.reconcile(row)
+    assert recorded[0]["status"] == "recovery_uncertain" and recorded[0]["verified_outcome"] == "unknown"
+    assert "escalated_to_human" in recorded[0]["reasons"] and env.executor.count == 0
+    assert "recovery_escalated" in kinds(env)

@@ -23,6 +23,7 @@ request and a new human decision.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from vsl_core.exceptions import AutomationDeniedException
@@ -30,7 +31,7 @@ from vsl_core.exceptions import AutomationDeniedException
 from app.governance.ledger import GovernanceLedgerError, GovernanceRecorder
 from app.recovery.compensation import plan_for
 from app.recovery.actions import PreconditionFailed, RecoveryExecutor
-from app.recovery.approvals import ApprovalDenied, ApprovalService, validate_action_safely
+from app.recovery.approvals import ApprovalDenied, ApprovalService, idempotency_key, validate_action_safely
 
 
 # After these the effect on state is wrong or unknown, so a person must take over. 'failed' (precondition) and 'blocked'
@@ -44,6 +45,10 @@ class RecoveryContext:
     request_id: str
     binding_digest: str
     decision_id: str
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class RecoveryRunner:
@@ -87,7 +92,21 @@ class RecoveryRunner:
         except GovernanceLedgerError:
             return {"status": "blocked", "reasons": ["ledger_not_verified_before_execution"]}
 
+        claim = {"held": False}
+        # claim state for each final status; None = release (nothing was done)
+        claim_states = {"executed": "succeeded", "succeeded_unrecorded": "succeeded", "verification_failed": "failed", "uncertain": "uncertain"}
+
         def finish(status: str, outcome: str, reasons: list[str], **payload: Any) -> dict[str, Any]:
+            if claim["held"]:  # settle the idempotency claim first, so a failure below can never leave it open as 'claimed'
+                claim["held"] = False
+                settled = claim_states.get(status, "released")
+                payload = {**payload, "idempotency_claim": settled}  # audit: how this operation's claim was settled
+                try:
+                    self.approvals.store.finish_claim(record.request_id, settled, _now())
+                except AutomationDeniedException:
+                    raise
+                except Exception:  # noqa: BLE001 - a store failure here must not hide the outcome; an open claim blocks, which is safe
+                    reasons = [*reasons, "claim_settle_failed"]
             try:
                 rec.monitor(decision_id=did, drift=False, caused_by=attempt.entry_id, outcome=outcome,
                             request_id=record.request_id, action=action, **payload)
@@ -113,12 +132,31 @@ class RecoveryRunner:
             facts = self.executor.check_precondition(validated)
         except PreconditionFailed as exc:
             return finish("failed", "recovery_failed", ["precondition_failed"], detail=str(exc)[:120],
-                          side_effect="none")
+                          side_effect="none", failed_check=getattr(exc, "check", "precondition"))
         except AutomationDeniedException:
             raise
         except Exception as exc:  # noqa: BLE001 - read-only step; nothing has changed, so this is a safe failure
             return finish("failed", "recovery_failed", ["precondition_error"], error=type(exc).__name__,
                           side_effect="none")
+
+        # 3b. idempotency: one claim per OPERATION (incident, action, parameters, target), taken before the approval is spent
+        key = idempotency_key(record.incident_id, record.action_type, record.parameters, record.target)
+        try:
+            claimed = self.approvals.store.claim_execution(key, record.request_id, did, _now())
+        except AutomationDeniedException:
+            raise
+        except Exception as exc:  # noqa: BLE001 - cannot establish the claim: nothing has happened, so block
+            return finish("blocked", "recovery_blocked", [f"idempotency_store_error:{type(exc).__name__}"])
+        if not claimed:
+            return finish("blocked", "recovery_blocked", ["duplicate_or_unreconciled_operation"], idempotency_key=key)
+        claim["held"] = True
+        try:  # audit: the claim itself is a recorded decision; if it cannot be recorded, release it and do nothing
+            rec.monitor(decision_id=did, drift=False, caused_by=attempt.entry_id, outcome="idempotency_claim_acquired",
+                        request_id=record.request_id, action=action, idempotency_key=key)
+        except AutomationDeniedException:
+            raise
+        except Exception as exc:  # noqa: BLE001 - nothing has been spent or executed yet: release and block
+            return finish("blocked", "recovery_blocked", [f"claim_not_recorded:{type(exc).__name__}"])
 
         # 4. atomic single-use consumption (re-validates binding, seal, expiry and approver role)
         try:
